@@ -76,8 +76,63 @@ before an event resolves against the book as it stood before that event; anythin
 millisecond resolves after the event has been applied. An order still pending when the market closes did not
 land.
 
-**Resting orders** (anything other than IOC) are refused. A resting order's fill depends on its place in the queue,
-which the archive does not record; a guessed queue model inflates market-making returns.
+**Resting orders** (`tif: "gtc"`, Polymarket only) are filled by a queue model, `polymarket-queue-v1`. A resting
+order's fill depends on its place in the queue, which no public feed records, and an optimistic guess inflates
+market-making returns by multiples — so the model is built from what the archive does record, and every ambiguity
+is resolved against the strategy.
+
+*What the archive says, measured.* On the public sample day (BTC 5-minute, 2026-09-08), joined against the
+venue's own per-match trade records:
+
+- The book is **mirrored**. Every `price_change` carries a pair: a bid for UP at q and an ask for DOWN at 1 − q,
+  same size. They are one queue, published twice. Every own order is therefore placed in one canonical queue,
+  UP's view: buying DOWN at q sits with the UP asks at 1 − q, selling DOWN at q with the UP bids at 1 − q.
+- A trade **prints once, on the taker's token**: 480,491 prints, 480,491 distinct transaction hashes, and in a
+  market joined trade by trade, 1,138 of 1,138 prints carried the taker's token, the taker's direction and the
+  taker's total size. The price is a maker price — of a multi-level sweep, sometimes the best and sometimes the
+  worst. Makers sit on either token: in that market 555 of the 1,138 prints were pure mints (a DOWN buyer filled
+  by resting UP bids). A resting UP bid is consumed by UP sell prints at its price **and** DOWN buy prints at
+  1 − its price.
+- Trades and the top of book are stored in full; book deltas are thinned per market (dropped, not merged — each
+  kept delta still states the true size of its level at that instant); snapshots are thinned per token.
+- A print can **trail the book update it caused**. For about a quarter of taker-buy prints the full-rate top of
+  book already showed the level gone before the print's own timestamp (99.9th percentile of that lead: 702 ms for
+  taker buys, 639 ms for taker sells, on observed transitions).
+
+*The rules.*
+
+1. **Join.** An order that reaches the venue (after `latency`) takes liquidity first if it is marketable on its
+   own token, exactly like an IOC (or is refused, with `post_only`); the remainder rests behind the size visible
+   at its price on the canonical ladder. Own orders at the same price queue in arrival order; two own orders that
+   would cross each other are refused.
+2. **Reach.** A print fills only orders at prices at least as good as its own price. The print's price may be the
+   best of a sweep, so nothing beyond it is assumed reached.
+3. **One volume budget per print.** Walking the reached prices best first, the print's size pays, in order: depth
+   the book removed within the lag window before the print, at that depth's own price (the depletion ledger — the
+   print that explains a book update must not be able to reach past the volume that update removed); the external
+   queue in front of each own order; the order itself; the rest of the level. Own fills plus everything else never
+   exceed the size that printed.
+4. **Book updates shorten, never fill.** After any book event an order's queue estimate is capped at the visible
+   size of its level — whatever was in front of it and still rests is visible. A missed add in a thinned delta
+   stream can make a level look shorter than it was; that is the one direction this rule can err, and it is
+   disclosed. A book that crosses a resting order does not fill it (an absolute size is not arriving aggressive
+   volume); such crossings are counted in the report.
+5. **Lag window, both ways** (`print_lag_ms`, 800 ms: the measured 99.9th percentile above, rounded up). A new
+   order ignores every print stamped within the window after it rests — that print may describe a match from
+   before it existed. A cancelled order stays exposed for the window after the cancel lands (`cancel_latency`) — a
+   print in it may describe a match from before the cancel. The second rule is a stress assumption and is labelled
+   one.
+6. **Close.** Every order still working at the close expires before settlement, including ones that had not
+   reached the venue yet. Nothing fills after the close.
+
+Fills are at the order's own limit. The model is the same code in both engines and the conformance suite compares
+them fill for fill, including queue and markout fields. The report's `maker` block carries the counters (rested,
+filled, cancelled, expired, refused, volume held back by the lag window, book crossings), fill rate by size and by
+order, median queue ahead at entry and at fill, median time in queue, and markouts: the mid of the fill token 1 s,
+10 s and 60 s after each fill (from the latest book at or before that instant, null if that book is more than 5 s
+old or the horizon passes the close), and to settlement, all per share and signed for the holder. The independent
+auditor does not yet re-derive resting-order fills and refuses such reports with its own exit code rather than
+passing them.
 
 ## 4. Settlement
 
@@ -90,9 +145,9 @@ The run's fee policy is one of:
 
 - **venue** (default) — each market's own schedule. Polymarket's crypto markets charge the taker
   `C × rate × p × (1 − p)` in USDC, rounded to five decimals, and charge makers nothing; the archive carries each
-  market's `feeSchedule` (on the 2026-09-08 sample: `rate 0.07, exponent 1`). Every fill a backtest makes is a taker
-  fill, so every fill pays.
-- **bps** — a flat rate on notional, set with `fee_bps` (including 0).
+  market's `feeSchedule` (on the 2026-09-08 sample: `rate 0.07, exponent 1`). Taker fills pay it; resting-order
+  (maker) fills pay nothing, and the venue's maker rebate — paid from a pool, not per fill — is not modelled.
+- **bps** — a flat rate on notional for every fill, taker or maker, set with `fee_bps` (including 0).
 
 Details that the report's `fee_model` block states:
 

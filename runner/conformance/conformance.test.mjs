@@ -165,6 +165,54 @@ function bboEvents() {
 }
 
 /**
+ * A mirrored market that resting orders can live in.
+ *
+ * The book is published the way Polymarket publishes it (UP bids at q are DOWN
+ * asks at 1−q), it moves, levels shrink through deltas BEFORE the prints that
+ * explain them arrive, the top-of-book stream prunes, and prints come on BOTH
+ * tokens — a DOWN buyer consumes resting UP bids. Every path of the queue model
+ * is exercised: entry window, ledger, waterfall across prices, cancel window,
+ * reduce-only clamp, markouts.
+ */
+function makerEvents() {
+  const ev = [];
+  const mirror = (ts, upBids, upAsks) => ({
+    kind: 'book', ts_ms: ts, snapshot: true,
+    levels: {
+      UP: { bids: upBids, asks: upAsks },
+      DOWN: {
+        bids: upAsks.map(([q, s]) => [Number((1 - q).toFixed(4)), s]),
+        asks: upBids.map(([q, s]) => [Number((1 - q).toFixed(4)), s]),
+      },
+    },
+  });
+  const trade = (ts, side, taker, px, size) => ({ kind: 'trade', ts_ms: ts, market_id: '0xconf', side, taker, px, size });
+  let mid = 0.45;
+  for (let i = 0; i < 60; i += 1) {
+    const ts = 1000 + i * 700;
+    mid = Number((mid + (i % 9 === 0 ? 0.011 : (i % 4 === 0 ? -0.006 : 0.002))).toFixed(3));
+    const b1 = Number((mid - 0.01).toFixed(3));
+    const a1 = Number((mid + 0.01).toFixed(3));
+    if (i % 5 === 0) {
+      ev.push(mirror(ts, [[b1, 80 + (i % 3) * 30], [Number((b1 - 0.01).toFixed(3)), 300]],
+        [[a1, 90 + (i % 4) * 25], [Number((a1 + 0.01).toFixed(3)), 400]]));
+    } else {
+      // A level shrinks (the book shows the trade first) ...
+      ev.push(deltaEv(ts, 'UP', 'bids', b1, 40 + (i % 6) * 10));
+      ev.push(deltaEv(ts, 'DOWN', 'asks', Number((1 - b1).toFixed(3)), 40 + (i % 6) * 10));
+    }
+    ev.push(tick(ts + 1, 65000 + i));
+    // ... and the prints follow, on both tokens and both directions.
+    ev.push(trade(ts + 120, 'UP', 'SELL', b1, 35 + (i % 7) * 9));
+    ev.push(trade(ts + 260, 'DOWN', 'BUY', Number((1 - b1).toFixed(3)), 20 + (i % 5) * 11));
+    ev.push(trade(ts + 400, 'UP', 'BUY', a1, 30 + (i % 3) * 17));
+    ev.push(trade(ts + 520, 'DOWN', 'SELL', Number((1 - a1).toFixed(3)), 15 + (i % 4) * 8));
+    if (i % 11 === 3) ev.push(bboEv(ts + 600, 'UP', Number((b1 - 0.02).toFixed(3)), a1));
+  }
+  return ev;
+}
+
+/**
  * Scenarios. Each is the same behaviour written once per language.
  *
  * They are chosen to hit the places the two engines could plausibly disagree:
@@ -771,7 +819,9 @@ async function run(lang, scenario, jobOverrides = {}) {
     on_trade: ['onTrade', 'on_trade'],
     on_settle: ['onSettle', 'on_settle'],
   };
-  const wantedHooks = ['on_market_open', 'on_tick', ...(scenario.hooks ?? [])];
+  // A template declares exactly its manifest's hooks (the market-making one has
+  // no on_tick); the inline cases all have on_market_open and on_tick.
+  const wantedHooks = scenario.exactHooks ?? ['on_market_open', 'on_tick', ...(scenario.hooks ?? [])];
   const job = {
     outputKey,
     entry: { file: isPy ? 'strategy.py' : 'strategy.mjs', className: scenario.className ?? 'S' },
@@ -791,7 +841,7 @@ async function run(lang, scenario, jobOverrides = {}) {
   };
   // Named rather than a chain of booleans: the third builder is where a
   // `a ? x : b ? y : z` starts silently picking the wrong fixture.
-  const BUILDERS = { oneSided: oneSidedEvents, bbo: bboEvents, nearClose: nearCloseEvents };
+  const BUILDERS = { oneSided: oneSidedEvents, bbo: bboEvents, nearClose: nearCloseEvents, maker: makerEvents };
   const events = (BUILDERS[scenario.events] ?? scenarioEvents)();
 
   // A scenario may declare reference feeds; their rows are INTERLEAVED into
@@ -915,6 +965,7 @@ async function templateScenario(id, overrides) {
     events: 'nearClose',
     className: manifest.entry.split(':')[1],
     hooks: manifest.hooks.filter((h) => h !== 'on_market_open' && h !== 'on_tick'),
+    exactHooks: manifest.hooks,
     params: manifest.params,
     py: await read('python', 'strategy.py'),
     js: await read('nodejs', 'strategy.mjs'),
@@ -928,6 +979,17 @@ async function templateScenario(id, overrides) {
 }
 
 SCENARIOS.push(
+  // The market-making template rests orders, so it runs on the mirrored maker
+  // fixture with the resting policy its manifest implies, and must get filled.
+  await templateScenario('spread-quote', {
+    events: 'maker',
+    job: { resting: { allowed: true, cancelLatencyMs: 100 }, fillDelayMs: 150 },
+    expect: () => {},
+    expectFills: (fills) => {
+      assert.ok(fills.some((f) => f.liquidity === 'maker' && f.side === 'UP'), 'spread-quote: no UP maker fill');
+      assert.ok(fills.some((f) => f.liquidity === 'maker' && f.side === 'DOWN'), 'spread-quote: no DOWN maker fill');
+    },
+  }),
   await templateScenario('favourite-near-close'),
   await templateScenario('binance-lead', {
     references: ['binance:btcusdt:spot:1s'],
@@ -943,11 +1005,172 @@ SCENARIOS.push(
   }),
 );
 
+// Resting orders: the queue model is the newest and most intricate code either
+// engine has, so it gets a scenario that walks every path at once — quoting
+// both tokens, cancel/replace by id and by client_id, post_only, a marketable
+// gtc that takes then rests, reduce-only exits — under entry AND cancel
+// latency, with venue and flat fees.
+const MAKER_JS = `export class S {
+      onMarketOpen(ctx, m) { this.n = 0; }
+      onTick(ctx, t) {
+        this.n += 1;
+        const b = ctx.book();
+        const bid = b.bestBid("UP");
+        const ask = b.best("UP");
+        if (bid == null || ask == null) return null;
+        const r3 = (x) => Math.floor(x * 1000 + 0.5) / 1000;
+        const out = [];
+        const open = ctx.orders();
+        if (this.n % 6 === 1) {
+          for (const o of open) ctx.cancel(o.id);
+          out.push({ side: "UP", size: 40, limit: r3(bid), tif: "gtc", client_id: "bid" + this.n });
+          // marketable on arrival (takes, then rests) — on a round where we do
+          // not also quote the other side, or it would cross our own order
+          if (this.n % 12 === 7) out.push({ side: "UP", size: 500, limit: r3(ask), tif: "gtc" });
+          else out.push({ side: "DOWN", size: 30, limit: r3(1 - ask), tif: "gtc", post_only: true });
+        }
+        const pos = ctx.position();
+        if (this.n % 6 === 4 && pos.side && pos.size > 0) {
+          out.push({ side: pos.side, size: pos.size, limit: r3(Math.min(0.99, pos.avg_entry + 0.02)), tif: "gtc", reduce_only: true });
+        }
+        if (this.n % 6 === 5 && open.length) ctx.cancel(open[0].client_id ?? open[0].id);
+        return out;
+      }
+    }`;
+const MAKER_PY = `import math
+
+
+def r3(x):
+    return math.floor(x * 1000 + 0.5) / 1000
+
+
+class S:
+    def on_market_open(self, ctx, market):
+        self.n = 0
+
+    def on_tick(self, ctx, tick):
+        self.n += 1
+        b = ctx.book()
+        bid = b.best_bid("UP")
+        ask = b.best("UP")
+        if bid is None or ask is None:
+            return None
+        out = []
+        open_ = ctx.orders()
+        if self.n % 6 == 1:
+            for o in open_:
+                ctx.cancel(o.id)
+            out.append({"side": "UP", "size": 40, "limit": r3(bid), "tif": "gtc", "client_id": "bid" + str(self.n)})
+            if self.n % 12 == 7:
+                out.append({"side": "UP", "size": 500, "limit": r3(ask), "tif": "gtc"})
+            else:
+                out.append({"side": "DOWN", "size": 30, "limit": r3(1 - ask), "tif": "gtc", "post_only": True})
+        pos = ctx.position()
+        if self.n % 6 == 4 and pos.side and pos.size > 0:
+            out.append({"side": pos.side, "size": pos.size, "limit": r3(min(0.99, pos.avg_entry + 0.02)),
+                        "tif": "gtc", "reduce_only": True})
+        if self.n % 6 == 5 and open_:
+            first = open_[0]
+            ctx.cancel(first.client_id if first.client_id is not None else first.id)
+        return out
+`;
+for (const [label, job] of [
+  ['flat fee, latency', { feeBps: 20, fillDelayMs: 150, resting: { allowed: true, cancelLatencyMs: 50 } }],
+  ['venue fee, zero latency', { fees: { mode: 'venue' }, fillDelayMs: 0, resting: { allowed: true, cancelLatencyMs: 0 } }],
+]) {
+  SCENARIOS.push({
+    name: `resting orders (${label})`,
+    events: 'maker',
+    job,
+    markets: [{ ...MARKET, close_ts_ms: 44_000, fee: { model: 'polymarket-taker-v1', rate: 0.07 } }],
+    js: MAKER_JS,
+    py: MAKER_PY,
+    // Agreement alone would pass two engines that both never fill a resting
+    // order. Both kinds of liquidity have to show up.
+    expectFills: (fills) => {
+      assert.ok(fills.some((f) => f.liquidity === 'maker'), 'no maker fill');
+      assert.ok(fills.some((f) => f.liquidity === 'maker' && f.action === 'reduce'), 'no maker exit');
+      assert.ok(fills.some((f) => f.liquidity === 'taker' && f.order_id), 'no taker part of a gtc');
+      assert.ok(fills.some((f) => f.markout_1s != null), 'no markout resolved');
+    },
+  });
+}
+
+// The lifecycle's rarer exits, each forced once: post_only refused on arrival,
+// a cancel that lands before the order does, a reduce-only order whose
+// position an IOC already closed, and expiry at the close.
+SCENARIOS.push({
+  name: 'resting orders: rare lifecycle exits',
+  events: 'maker',
+  // Entry latency 1000 > the 700ms tick spacing, so a cancel on the next tick
+  // lands before the order does; cancels take effect at once.
+  job: { feeBps: 0, fillDelayMs: 1000, resting: { allowed: true, cancelLatencyMs: 0 } },
+  markets: [{ ...MARKET, close_ts_ms: 30_000 }],
+  expectStats: (s) => {
+    for (const k of ['rejected_post_only', 'cancelled_before_entry', 'cancelled_no_position', 'expired']) {
+      assert.ok(s[k] >= 1, `${k} never happened: ${JSON.stringify(s)}`);
+    }
+  },
+  js: `export class S {
+    onMarketOpen(ctx, m) { this.n = 0; }
+    onTick(ctx, t) {
+      this.n += 1;
+      const b = ctx.book();
+      const bid = b.bestBid("UP"), ask = b.best("UP");
+      if (bid == null || ask == null) return null;
+      const r3 = (x) => Math.floor(x * 1000 + 0.5) / 1000;
+      if (this.n === 2) return { side: "UP", size: 10, limit: r3(ask), tif: "gtc", post_only: true };
+      if (this.n === 3) { const o = { side: "UP", size: 10, limit: r3(bid - 0.05), tif: "gtc", client_id: "early" }; return o; }
+      if (this.n === 4) { ctx.cancel("early"); return { side: "UP", size: 20, limit: 0.99 }; }
+      if (this.n === 6) return { side: "UP", size: 20, limit: r3(ask), tif: "gtc", reduce_only: true };
+      if (this.n === 7) return { side: "UP", size: 20, limit: 0.01, reduce_only: true };
+      if (this.n === 30) return { side: "UP", size: 5, limit: r3(bid - 0.1), tif: "gtc" };
+      return null;
+    }
+  }`,
+  py: `import math
+
+
+def r3(x):
+    return math.floor(x * 1000 + 0.5) / 1000
+
+
+class S:
+    def on_market_open(self, ctx, market):
+        self.n = 0
+
+    def on_tick(self, ctx, tick):
+        self.n += 1
+        b = ctx.book()
+        bid = b.best_bid("UP")
+        ask = b.best("UP")
+        if bid is None or ask is None:
+            return None
+        if self.n == 2:
+            return {"side": "UP", "size": 10, "limit": r3(ask), "tif": "gtc", "post_only": True}
+        if self.n == 3:
+            return {"side": "UP", "size": 10, "limit": r3(bid - 0.05), "tif": "gtc", "client_id": "early"}
+        if self.n == 4:
+            ctx.cancel("early")
+            return {"side": "UP", "size": 20, "limit": 0.99}
+        if self.n == 6:
+            return {"side": "UP", "size": 20, "limit": r3(ask), "tif": "gtc", "reduce_only": True}
+        if self.n == 7:
+            return {"side": "UP", "size": 20, "limit": 0.01, "reduce_only": True}
+        if self.n == 30:
+            return {"side": "UP", "size": 5, "limit": r3(bid - 0.1), "tif": "gtc"}
+        return None
+`,
+});
+
 for (const scenario of SCENARIOS) {
   test(`both engines agree: ${scenario.name}`, async () => {
     // A scenario may carry its own params; without this the new cases would
     // run against {} and prove nothing.
-    const over = scenario.params ? { params: scenario.params } : {};
+    const over = {
+      ...(scenario.params ? { params: scenario.params } : {}),
+      ...(scenario.job ?? {}),
+    };
     const [js, py] = await Promise.all([
       run('node', scenario, over), run('python', scenario, over),
     ]);
@@ -980,9 +1203,18 @@ for (const scenario of SCENARIOS) {
       assert.equal(a.side, b.side, `${where}: side`);
       assert.equal(a.action, b.action, `${where}: action`);
       assert.equal(a.levels_walked, b.levels_walked, `${where}: levels_walked`);
-      for (const f of ['ts_ms', 'requested', 'filled', 'unfilled', 'avg_px', 'worst_px', 'quoted_px', 'fee', 'realised']) {
+      assert.equal(a.liquidity, b.liquidity, `${where}: liquidity`);
+      assert.equal(a.order_id, b.order_id, `${where}: order_id`);
+      for (const f of ['ts_ms', 'requested', 'filled', 'unfilled', 'avg_px', 'worst_px', 'quoted_px', 'fee', 'realised',
+        'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
+        'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle']) {
         closeEnough(a[f], b[f], f, where);
       }
+    }
+
+    assert.equal(js.result.maker == null, py.result.maker == null, `${scenario.name}: maker stats present in one engine only`);
+    if (js.result.maker) {
+      for (const [k, v] of Object.entries(js.result.maker)) closeEnough(v, py.result.maker[k], `maker.${k}`, scenario.name);
     }
 
     closeEnough(js.result.feesPaid, py.result.feesPaid, 'fees_paid', scenario.name);
@@ -992,8 +1224,44 @@ for (const scenario of SCENARIOS) {
       scenario.expect(js.trades);
       scenario.expect(py.trades);
     }
+    if (scenario.expectStats) {
+      scenario.expectStats(js.result.maker);
+      scenario.expectStats(py.result.maker);
+    }
+    if (scenario.expectFills) {
+      scenario.expectFills(js.fills);
+      scenario.expectFills(py.fills);
+    }
   });
 }
+
+test('session mode: resting orders in overlapping markets — rows leave only once their markouts are final', async () => {
+  const A = { ...MARKET, market_id: '0xA', open_ts_ms: 0, close_ts_ms: 25_000 };
+  const B = { ...MARKET, market_id: '0xB', outcome: 'DOWN', open_ts_ms: 9_000, close_ts_ms: 44_000 };
+  const evs = makerEvents();
+  const scenario = {
+    name: 'session-maker',
+    markets: [A, B],
+    marketEvents: {
+      '0xA': evs.filter((e) => e.ts_ms <= 25_000),
+      '0xB': evs.filter((e) => e.ts_ms >= 9_000),
+    },
+    js: MAKER_JS,
+    py: MAKER_PY,
+  };
+  const job = { mode: 'session', feeBps: 0, fillDelayMs: 100, resting: { allowed: true, cancelLatencyMs: 100 } };
+  const [js, py] = await Promise.all([run('node', scenario, job), run('python', scenario, job)]);
+  assert.equal(js.code, 0, js.stderr + JSON.stringify(js.result.rejection));
+  assert.equal(py.code, 0, py.stderr + JSON.stringify(py.result.rejection));
+  const makerA = js.fills.filter((f) => f.liquidity === 'maker' && f.market_id === '0xA');
+  assert.ok(makerA.length > 0 && js.fills.some((f) => f.liquidity === 'maker' && f.market_id === '0xB'));
+  // A closes while B is open: every row of A carries its settle markout, and
+  // none of B's rows left before B's own close with that markout unset.
+  for (const f of js.fills.filter((x) => x.liquidity === 'maker')) assert.notEqual(f.markout_settle, null, JSON.stringify(f));
+  assert.deepEqual(py.fills, js.fills);
+  assert.deepEqual(py.trades, js.trades);
+  assert.deepEqual(py.result.maker, js.result.maker);
+});
 
 // Both bounds on the result channel, checked in both engines at once.
 //
@@ -1131,31 +1399,37 @@ test('cross-market reads are refused in both engines', async () => {
   assert.match(py.result.rejection.detail, /session/);
 });
 
-test('both engines refuse an unsupported time-in-force', async () => {
-  const gtc = {
-    name: 'gtc',
+test('both engines refuse an unsupported time-in-force, and gtc without a resting policy', async () => {
+  const shape = (tif) => ({
+    name: tif,
     js: `export class S {
       onMarketOpen() {}
-      onTick() { return { side: "UP", size: 100, limit: 0.95, tif: "gtc" }; }
+      onTick() { return { side: "UP", size: 100, limit: 0.95, tif: "${tif}" }; }
     }`,
     py: `class S:
     def on_market_open(self, ctx, market):
         pass
 
     def on_tick(self, ctx, tick):
-        return {"side": "UP", "size": 100, "limit": 0.95, "tif": "gtc"}
+        return {"side": "UP", "size": 100, "limit": 0.95, "tif": "${tif}"}
 `,
-  };
-  const [js, py] = await Promise.all([run('node', gtc), run('python', gtc)]);
+  });
+  const [js, py] = await Promise.all([run('node', shape('fok')), run('python', shape('fok'))]);
   assert.equal(js.code, 10);
   assert.equal(py.code, 10);
   assert.match(js.result.rejection.detail, /tif/);
   assert.match(py.result.rejection.detail, /tif/);
+  // The job carries no resting policy here: gtc is refused with its reason.
+  const [jg, pg] = await Promise.all([run('node', shape('gtc')), run('python', shape('gtc'))]);
+  assert.equal(jg.code, 10);
+  assert.equal(pg.code, 10);
+  assert.match(jg.result.rejection.detail, /resting/);
+  assert.match(pg.result.rejection.detail, /resting/);
 });
 
 test('neither engine lets a strategy steal the market before its first hook', async () => {
   // The cross-language version of the harness test: the interception point
-  // differs (Array.prototype.push / JSON.parse in JS, json.loads in Python) but
+  // differs (JSON.parse in JS, json.loads in Python) but
   // the hole was the same — the harness materialised the whole market before
   // replay, and the strategy was imported first.
   const thief = {
@@ -1164,8 +1438,9 @@ test('neither engine lets a strategy steal the market before its first hook', as
 const stolen = [];
 const realParse = JSON.parse;
 JSON.parse = function (s) { const v = realParse(s); if (v && v.kind === "tick") stolen.push(v.value); return v; };
-const realPush = Array.prototype.push;
-Array.prototype.push = function (...a) { for (const x of a) if (x && x.kind === "tick") stolen.push(x.value); return realPush.apply(this, a); };
+// (Array.prototype.push used to be patched here too; the Node harness now
+// freezes Array.prototype before loading a strategy, so that patch is a load
+// error — covered in harness.test.mjs.)
 
 export class S {
   onMarketOpen() { this.first = true; }

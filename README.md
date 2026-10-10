@@ -4,8 +4,9 @@
 **Tick-level backtesting for Polymarket and Predict.fun crypto Up/Down markets, in JavaScript.** Write a
 strategy class, replay it locally with the `ot` command line against the archived order book, and submit the
 same files to the [hosted backtester](https://outcometick.com/backtest) when you want the full range. Every
-market settles at $1 / $0 on the Chainlink stream it actually settled on, and every fill pays the venue's taker
-fee.
+market settles at $1 / $0 on the Chainlink stream it actually settled on, and every taker fill pays the venue's
+taker fee. Market makers get resting limit orders with a queue model built on how Polymarket actually records
+trading, and the markouts to see whether the fills were worth having.
 
 **English** · [简体中文](README.zh-CN.md) · [Methodology](docs/methodology.md) ·
 [How we verify it](docs/verification.md) · Python: [polymarket-backtest](https://github.com/outcometick/polymarket-backtest)
@@ -90,6 +91,19 @@ markets had no readable schedule. It is an estimate in one respect, and the repo
 per maker order matched, the archive keeps book levels, so the fee is computed and rounded per level taken.
 `"fee_bps"` in the manifest replaces it with a flat rate.
 
+**Resting orders, queued the way the venue trades.** `new Order({ ..., tif: "gtc" })` rests at its limit behind
+the size already visible at that price. The queue model is built on three measured facts about the archive, not
+on a generic exchange: the book is *mirrored* (an UP bid at q and a DOWN ask at 1 − q are one queue, published
+twice), each trade prints *once, on the taker's token* (so a DOWN buyer taking resting UP bids — a mint —
+advances an UP bid's queue; a single-token model misses about half of what consumes it), and a print can arrive
+*after* the book update it caused. So a print fills a resting order only if its price reaches the order, out of
+one volume budget that first pays for depth the book removed just before it, at that depth's own price; a new
+order ignores prints for a short lag window, and a cancelled one stays exposed for it. `"latency"` and
+`"cancel_latency"` are separate, maker fills pay no fee (rebates are not modelled), and the JavaScript and Python
+engines agree fill for fill. `ctx.orders()` lists working orders, `ctx.cancel(id)` cancels one. The report adds
+what a market maker looks at: fill rate, queue position at entry and at fill, time in queue, and markouts 1s /
+10s / 60s after each fill and to settlement — adverse selection, in numbers.
+
 **No look-ahead by construction.** Events reach the strategy one at a time; the rest of the day is not in the
 process. A market's `outcome` is hidden until `onSettle`. In session mode, markets that overlap in time are
 replayed interleaved in one time order, so state carried across markets never runs ahead of the clock.
@@ -117,8 +131,10 @@ market-day that could not be replayed is listed with the reason.
 
 ## Limits
 
-- Orders take liquidity (IOC). Resting limit orders need a queue-position model; a guessed one inflates
-  market-making returns, so they are refused rather than approximated. A conservative queue model is next.
+- Resting orders: queue position is an estimate from aggregated book levels (individual maker orders are not
+  in the feed), book deltas are thinned to a capture cadence, and your orders have no market impact. They run
+  on Polymarket only: the Predict.fun archive has no trade stream to advance a queue, so `gtc` is refused there.
+  The independent auditor does not yet re-derive resting-order fills.
 - 5-minute and 15-minute crypto Up/Down markets, the ones the archive holds.
 - The Binance reference feed lives on the hosted runner, so strategies that read it are submitted, not run
   locally.
