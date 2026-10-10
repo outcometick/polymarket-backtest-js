@@ -1,0 +1,20 @@
+name: verify
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The Python harness and analyser are part of the package (ot run replays
+      # Python strategies too), and the conformance suite runs both engines.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: npm install
+      - run: npm test
+      - run: node --test runner/conformance/*.test.mjs

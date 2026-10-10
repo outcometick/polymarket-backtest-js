@@ -1,0 +1,565 @@
+// Translating between what a strategy asks for and what the archive holds.
+//
+// The SDK's dataset names are a product surface: `book`, `trades`, `settlement`.
+// The archive's are a storage detail: `price_change`, `orderbook`,
+// `last_trade_price`, `chainlink-twap-60s`. Keeping the two apart is what lets
+// the archive be reorganised without breaking a manifest a customer wrote three
+// months ago.
+//
+// The interesting one is `settlement`, which is not a stored stream at all.
+
+import { classifyPath } from './data-taxonomy.mjs';
+import {
+  CAPTURE_WINDOWS, DERIVED_DATASETS, KNOWN_DATASETS, BacktestRejection,
+  MARKET_INTERVALS, DEFAULT_INTERVALS, MAX_LATENCY_MS, OPT_IN_DATASETS,
+  DEGRADING_DATASETS,
+} from './backtest-contract.mjs';
+
+/**
+ * SDK dataset name -> the archive dataset names that satisfy it, per venue.
+ *
+ * `book` and `trades` are one concept each to a strategy but two different
+ * trees per venue: Polymarket publishes full snapshots plus deltas, Predict.fun
+ * publishes a single `orderbook` tree. A strategy that declares `book` gets
+ * whatever that venue actually has, which is the point of naming it `book`.
+ */
+export const ARCHIVE_DATASETS = Object.freeze({
+  polymarket: Object.freeze({
+    prices: Object.freeze(['prices']),
+    twap30s: Object.freeze(['twap30s']),
+    twap60s: Object.freeze(['twap60s']),
+    book: Object.freeze(['book', 'price_change']),
+    bbo: Object.freeze(['best_bid_ask']),
+    trades: Object.freeze(['last_trade_price']),
+    markets: Object.freeze(['markets']),
+  }),
+  // Predict.fun has no equivalent stream. Deliberately absent rather than
+  // mapped to something close: `archiveDatasetsFor` would silently fetch
+  // nothing, and a strategy would get an empty feed with no error. The
+  // rejection comes from CAPTURE_WINDOWS.predict having no `bbo` entry, which
+  // makes uncapturedRange return the whole range -> E_COVERAGE.
+  predict: Object.freeze({
+    prices: Object.freeze(['prices']),
+    twap30s: Object.freeze(['twap30s']),
+    twap60s: Object.freeze(['twap60s']),
+    book: Object.freeze(['orderbook']),
+    trades: Object.freeze(['last_trade_price']),
+    markets: Object.freeze(['markets']),
+  }),
+});
+
+/**
+ * `markets` is always fed, whether or not a strategy declares it.
+ *
+ * Not a convenience: on_market_open carries the strike and on_settle carries
+ * the official outcome, both of which live in the markets tree, and the
+ * settlement-stream resolution below reads twapLookbackSeconds from the same
+ * place. A run without it could not identify which stream a market settled on,
+ * which is the one thing this product exists to get right.
+ */
+export const ALWAYS_FED = Object.freeze(['markets']);
+
+/**
+ * Which captured stream a single market settled on.
+ *
+ * Read from the market's OWN config, never inferred from its date. The venues
+ * moved 5-minute markets onto a 30-second TWAP and then onto 60, while
+ * 15-minute markets went straight to 60 — so any date-based rule is wrong for
+ * whole classes of market inside the transition, and wrong quietly. The market
+ * record states its own lookback; that is the answer.
+ *
+ * Fail-closed on anything unrecognised. A market whose config we cannot read is
+ * not guessed at: the caller gets null and must reject the market-day rather
+ * than feed a strategy a stream the market did not settle on.
+ *
+ * @param {object} market a row from the markets dataset
+ * @returns {'prices'|'twap30s'|'twap60s'|null}
+ */
+export function resolveSettlementStream(market) {
+  const cfg = market?.raw?.cryptoMarketConfig ?? market?.cryptoMarketConfig ?? null;
+  // No config object at all is a record we could not read, NOT evidence of the
+  // pre-TWAP regime. An earlier version returned 'prices' here and that was
+  // fail-OPEN in the worst possible place: every market whose metadata we
+  // failed to parse would have been fed the 1 Hz stream and silently reported
+  // as if that were what it settled on. A dropped market-day is visible in
+  // coverage and costs the customer nothing; a wrong settlement stream is
+  // invisible and makes the whole report a lie.
+  if (!cfg || typeof cfg !== 'object') return null;
+  if (!Object.prototype.hasOwnProperty.call(cfg, 'twapLookbackSeconds')) return null;
+
+  const lookback = cfg.twapLookbackSeconds;
+  // An explicit null or 0 IS a positive statement: this market settled on the
+  // instantaneous stream. That is different from the field being absent.
+  if (lookback === null || lookback === 0) return 'prices';
+  if (lookback === 30) return 'twap30s';
+  if (lookback === 60) return 'twap60s';
+  return null;
+}
+
+/**
+ * Is a captured stream available for this venue on this day?
+ *
+ * Both ends are inclusive and `to: null` means "still capturing".
+ */
+export function isCaptured(venue, dataset, day) {
+  const w = CAPTURE_WINDOWS[venue]?.[dataset];
+  if (!w) return false;
+  if (day < w.from) return false;
+  if (w.to && day > w.to) return false;
+  return true;
+}
+
+/**
+ * Every day in [from, to] on which a captured stream is unavailable.
+ *
+ * Returned rather than counted so E_COVERAGE can name the range that failed —
+ * "twap60s is not captured before 2026-08-07" is actionable, "coverage error"
+ * is not.
+ */
+export function uncapturedRange(venue, dataset, from, to) {
+  const w = CAPTURE_WINDOWS[venue]?.[dataset];
+  if (!w) return { from, to };
+  const badFrom = from < w.from ? from : null;
+  const badTo = badFrom ? (to < w.from ? to : prevDay(w.from)) : null;
+  if (badFrom) return { from: badFrom, to: badTo };
+  if (w.to && to > w.to) return { from: nextDay(w.to), to };
+  return null;
+}
+
+function shiftDay(day, delta) {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+const prevDay = (d) => shiftDay(d, -1);
+const nextDay = (d) => shiftDay(d, 1);
+
+/**
+ * Check a manifest's declared datasets against a venue and date range.
+ *
+ * `settlement` is exempt: it resolves per market to whatever that market
+ * settled on, so it is available wherever the archive is — that is the entire
+ * reason to prefer it, and why the docs recommend it.
+ *
+ * Throws BacktestRejection(E_COVERAGE) on the first stream that is not
+ * available for the whole range, naming the gap.
+ */
+export function assertCoverage({ datasets, venue, from, to }) {
+  for (const ds of datasets ?? []) {
+    if (ds === 'settlement') continue;
+    // A degrading dataset never blocks a run: where the archive has it the run
+    // is refined, where it does not the run behaves as it always did. The days
+    // it covers are reported rather than enforced — see bboCoverage below and
+    // DEGRADING_DATASETS for why this one is not like the others.
+    if (DEGRADING_DATASETS.includes(ds)) continue;
+    if (DERIVED_DATASETS[ds]) {
+      // A derived stream is a function of one we hold, so its availability is
+      // the SOURCE stream's availability, not its own.
+      const src = DERIVED_DATASETS[ds].from;
+      const gap = uncapturedRange(venue, src, from, to);
+      if (gap) {
+        throw new BacktestRejection('E_COVERAGE',
+          `${ds} is derived from ${src}, which is not captured for ${gap.from}..${gap.to ?? gap.from} on ${venue}`,
+          { dataset: ds, derivedFrom: src, venue, gap });
+      }
+      continue;
+    }
+    const gap = uncapturedRange(venue, ds, from, to);
+    if (gap) {
+      const w = CAPTURE_WINDOWS[venue]?.[ds];
+      throw new BacktestRejection('E_COVERAGE',
+        `${ds} is not captured for ${gap.from}..${gap.to ?? gap.from} on ${venue}`
+        + (w ? ` (captured from ${w.from}${w.to ? ` to ${w.to}` : ''})` : '')
+        + '. Use settlement, or a :derived stream if you specifically want today\'s rules on older dates.',
+        { dataset: ds, venue, gap, capturedFrom: w?.from ?? null, capturedTo: w?.to ?? null });
+    }
+  }
+}
+
+/**
+ * Did this day actually read the archive dataset, judged by what it was decoded
+ * from rather than by what was asked for?
+ *
+ * `inputs` are "<path>:<sha256>" entries recorded by the decoder for every
+ * object it really opened. The sha is hex and paths do not contain a colon at
+ * the end, so the split is on the LAST one.
+ *
+ * WHY NOT THE REQUESTED DATASET LIST. A day inside the capture window whose
+ * object is simply missing from the catalog — our outage, not the customer's
+ * date range — still asks for `best_bid_ask`, decodes fine on the old book, and
+ * would be reported as covered. The report would then claim a refinement the
+ * replay never had.
+ */
+export function inputsInclude(inputs, archiveDataset) {
+  return inputKeys(inputs, archiveDataset).size > 0;
+}
+
+/**
+ * Which MARKET-DAYS an archive dataset was actually read for: `asset|interval`.
+ *
+ * The day alone is not the unit. A run reads each asset group separately and
+ * their inputs are merged, so "this date opened a best_bid_ask object" is true
+ * as soon as ONE asset did — a BTC+ETH run where only BTC has the object would
+ * replay ETH on the old book and report the whole date as covered. Same
+ * false-coverage class as inferring from the capture window, hidden one
+ * dimension further in.
+ *
+ * `asset|interval` rather than the full billing key because the caller already
+ * knows which day it is asking about; joined with the day it is exactly the
+ * `asset|day|interval` that countMarketDays bills on.
+ *
+ * A venue-wide object carries no asset (markets metadata does not), so it
+ * contributes nothing here — which is right: it is not a per-market-day fact.
+ */
+export function inputKeys(inputs, archiveDataset) {
+  const out = new Set();
+  for (const entry of inputs ?? []) {
+    const raw = String(entry);
+    // The sha is hex and an object key has no trailing colon, so split on the
+    // LAST one — a path that itself contains a colon must still classify.
+    const cut = raw.lastIndexOf(':');
+    const p = cut > 0 ? raw.slice(0, cut) : raw;
+    const c = classifyPath(p);
+    if (c.dataset !== archiveDataset) continue;
+    if (!c.asset) continue;
+    out.add(`${c.asset}|${c.interval ?? 'none'}`);
+  }
+  return out;
+}
+
+/**
+ * Split a run's days into the ones a degrading dataset covers and the ones it
+ * does not, so the report can state it rather than leave it to be inferred.
+ *
+ * Deliberately computed from CAPTURE_WINDOWS rather than from which files the
+ * worker happened to find: a day inside the window with a missing object is a
+ * gap in OUR archive and belongs in the same coverage entry as any other
+ * missing object, while a day before the window is not a gap at all — nothing
+ * was ever captured. Conflating them would report our outages as the customer's
+ * date range being too early.
+ *
+ * @returns {{covered: string[], missing: string[]}}
+ */
+export function degradingCoverage(venue, dataset, days) {
+  const covered = [], missing = [];
+  for (const d of days ?? []) (isCaptured(venue, dataset, d) ? covered : missing).push(d);
+  return { covered, missing };
+}
+
+/**
+ * The archive dataset names a run must fetch for a given manifest.
+ *
+ * `settlement` expands to every stream that could be authoritative for some
+ * market in the range: the resolution is per market and is not known until the
+ * markets metadata has been read, so the worker fetches the union and the
+ * engine picks per market. Streams outside their capture window are dropped
+ * rather than requested — no market in that window can have settled on them.
+ */
+export function archiveDatasetsFor({ datasets, venue, from, to }) {
+  const wanted = new Set();
+  for (const ds of [...(datasets ?? []), ...ALWAYS_FED]) {
+    if (ds === 'settlement') {
+      for (const s of ['prices', 'twap30s', 'twap60s']) {
+        if (!uncapturedRange(venue, s, from, to) || isCaptured(venue, s, to)) wanted.add(s);
+      }
+      continue;
+    }
+    const base = DERIVED_DATASETS[ds]?.from ?? ds;
+    wanted.add(base);
+  }
+  const out = new Set();
+  const map = ARCHIVE_DATASETS[venue] ?? {};
+  for (const w of wanted) for (const a of map[w] ?? []) out.add(a);
+  return [...out].sort();
+}
+
+/**
+ * The archive datasets to read FOR ONE DAY.
+ *
+ * Identical to archiveDatasetsFor for everything that is not degrading. The
+ * difference is the whole point: a degrading dataset is dropped on a day its
+ * capture window does not cover, so the files are never fetched, never decoded
+ * and never applied.
+ *
+ * WITHOUT THIS the range-level list is used for every day, and a run spanning
+ * the start of capture reads a PARTIAL day's file and applies it — while
+ * `bboCoverage` reports that same day as missing, because it asks
+ * CAPTURE_WINDOWS. The report would then state that a day ran on the old
+ * behaviour while it actually ran on a half-covered book. 2026-09-02 is exactly
+ * that day: capture began at 00:42:18Z, so markets opening before then get no
+ * refinement and markets after do — a density change inside one day, which is
+ * the thing the book cadence is carefully arranged never to produce.
+ *
+ * The range is still passed through rather than collapsed to the day, because
+ * `settlement` expands against the whole range and narrowing that here would
+ * change which streams a day fetches for reasons unrelated to this.
+ */
+export function archiveDatasetsForDay({ datasets, venue, day, from, to }) {
+  const usable = (datasets ?? []).filter(
+    (d) => !DEGRADING_DATASETS.includes(d) || isCaptured(venue, d, day),
+  );
+  return archiveDatasetsFor({ datasets: usable, venue, from, to });
+}
+
+/**
+ * The archive datasets a day is DECODED and CACHED as, for a run that asked
+ * for `archiveDatasets`: the request plus the venue's trades.
+ *
+ * The decoded-day cache is keyed on the dataset list, so every subset a
+ * manifest can declare used to be its own cache entry — and the prewarm only
+ * warms shapes that include trades. 54 of the first 69 real customer runs
+ * declared no trades (the CLI docs tell them "ask for less, run faster"), and
+ * every one of them decoded from cold beside a warmed copy of the same day.
+ *
+ * TRADES ALONE, because they are the one stream whose presence changes nothing
+ * else a decoded day holds, and so can be stripped back out exactly — see
+ * `omitsTrades` and the byte-identity test in fetch-data.test.mjs:
+ *  - a trade row becomes one `kind:'trade'` event and nothing more;
+ *  - the throttle only gates the book-delta stream, keyed per market;
+ *  - events are ordered by (ts, kind, snapshot) with a STABLE sort, so taking
+ *    the trades out afterwards leaves the rest in the order a decode without
+ *    them produces;
+ *  - the opening baseline reads book events only, `bboKeys` reads bbo events
+ *    only, and whether a market is usable does not look at trades
+ *    (marketUnusable).
+ * `bbo` and `book` are NOT like this: both change the book the engine and the
+ * baselines are priced on, so a day decoded with them cannot be turned into one
+ * decoded without them by deleting lines.
+ */
+export function decodeDatasetsFor({ archiveDatasets, venue }) {
+  const out = new Set(archiveDatasets);
+  for (const a of ARCHIVE_DATASETS[venue]?.trades ?? []) out.add(a);
+  return [...out].sort();
+}
+
+/**
+ * Did the run leave out trades that `decodeDatasetsFor` decoded anyway? Then
+ * its trade events have to be dropped before they reach the strategy, and the
+ * trade objects' bytes before they reach the report.
+ */
+export function omitsTrades({ archiveDatasets, venue }) {
+  return (ARCHIVE_DATASETS[venue]?.trades ?? []).some((a) => !archiveDatasets.includes(a));
+}
+
+/** Is this archive dataset one of the venue's trade streams? */
+export function isTradeDataset(venue, dataset) {
+  return (ARCHIVE_DATASETS[venue]?.trades ?? []).includes(dataset);
+}
+
+/**
+ * The settlement files a day's markets need, beyond what the strategy asked for.
+ *
+ * ALWAYS FED, like `markets`, and for the same reason: which stream a market
+ * settled on is a property of that market, so it cannot be known before the
+ * markets are read — and a run without it has no ticks at all. A strategy
+ * declaring `datasets: ["prices"]` was handed the 1 Hz feed while every market
+ * settled on twap60s, so nothing reached the engine and the day came back
+ * empty.
+ *
+ * SHARED, because the worker and `ot run` must select the same files. They
+ * already share the decoder; a feed list computed twice is the same drift in a
+ * different place, and it shows up as "it works locally but not in the queue"
+ * — or worse, the reverse.
+ *
+ * @param {Iterable} markets  normalised records, from indexMarkets
+ * @param {string[]} paths    every archive path available for the day
+ * @param {object} opts       venue, the assets in scope, and the paths already chosen
+ */
+export function settlementPathsFor(markets, paths, { venue, assets, already = [] }) {
+  const need = new Set();
+  for (const m of markets) if (m?.stream) need.add(m.stream);
+  if (need.size === 0) return [];
+  const have = new Set(already);
+  const inScope = new Set((assets ?? []).map((a) => String(a).toUpperCase()));
+  const out = [];
+  for (const p of paths) {
+    if (have.has(p)) continue;
+    const c = classifyPath(p);
+    if (c.venue !== venue || !need.has(c.dataset)) continue;
+    if (c.asset && inScope.size && !inScope.has(String(c.asset).toUpperCase())) continue;
+    out.push(p);
+  }
+  return out.sort();
+}
+
+/**
+ * The order a day's archive files are read in, fixed by path.
+ *
+ * NOT cosmetic. Events stamped the same millisecond are ordered by kind, and
+ * ties beyond that fall back to the order they were read — which was the
+ * catalog's order for the queue and the directory walk's for `ot run`. Two
+ * readers, two orders, one archive, two different reports. Sorting by path
+ * makes the input order a property of the archive rather than of whoever is
+ * reading it.
+ */
+export function orderedFeed(paths) {
+  return [...paths].sort();
+}
+
+/**
+ * Does an archived file belong to this run's scope?
+ *
+ * Runs on top of the entitlement gate, never instead of it: this decides what a
+ * paid-for run is FED, while scope.mjs decides what a customer may DOWNLOAD.
+ * A backtest reads files the submitter has not bought, which is the product —
+ * so this filter must never be mistaken for an authorisation check.
+ */
+export function fileMatchesRun(filePath, { venue, assets, archiveDatasets, intervals }) {
+  const meta = classifyPath(filePath);
+  if (meta.venue !== venue) return false;
+  if (!archiveDatasets.includes(meta.dataset)) return false;
+  // Venue-wide datasets (markets) carry no asset and are always in scope.
+  if (meta.asset && assets?.length && !assets.includes(meta.asset)) return false;
+  // The interval narrowing applies ONLY to files that have an interval.
+  //
+  // The settlement streams -- prices, twap30s, twap60s -- are interval:null,
+  // and they are not a choice: without one, every market in the day fails to
+  // settle, every market is unusable, and the whole run is dropped and
+  // refunded. Silently, because "no usable market" is indistinguishable from
+  // "the archive had nothing". So a null interval is always in scope, and only
+  // a file that actually declares one has to match.
+  if (meta.interval && intervals?.length && !intervals.includes(meta.interval)) return false;
+  return true;
+}
+
+/**
+ * Validate the declared latency comparison, returning it normalised.
+ *
+ * ONE delay in milliseconds, or null for none — which is the default. Each
+ * delay replays the whole range again, so this is deliberately not a list:
+ * see MAX_LATENCY_MS.
+ */
+export function normalizeLatency(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    // Said plainly rather than by silently taking the first: a manifest that
+    // asked for three delays and got one would be a run priced and timed for
+    // something the submitter did not write.
+    throw new BacktestRejection('E_MANIFEST',
+      'latency is a single delay in milliseconds, not a list — each delay replays the whole range again');
+  }
+  const ms = Number(value);
+  if (!Number.isInteger(ms) || ms <= 0 || ms > MAX_LATENCY_MS) {
+    throw new BacktestRejection('E_MANIFEST',
+      `latency must be a whole number of milliseconds between 1 and ${MAX_LATENCY_MS}, got ${JSON.stringify(value)}`);
+  }
+  return ms;
+}
+
+/** The highest flat fee override a manifest may declare: 10% of notional. */
+export const MAX_FEE_BPS = 1000;
+
+/**
+ * Validate a declared flat fee override, returning it normalised.
+ *
+ * Absent (null) means the venue's own schedule, market by market — the
+ * default. A number replaces it with a flat rate on notional, and 0 is a real
+ * override, not "unset": a strategy author pricing a fee rebate deal, or
+ * comparing gross and net, has to be able to say zero.
+ */
+export function normalizeFeeBps(value) {
+  if (value == null) return null;
+  const n = typeof value === 'number' ? value : Number.NaN;
+  if (!Number.isFinite(n) || n < 0 || n > MAX_FEE_BPS) {
+    throw new BacktestRejection('E_MANIFEST',
+      `fee_bps must be a number of basis points between 0 and ${MAX_FEE_BPS}, got ${JSON.stringify(value)}`);
+  }
+  return n;
+}
+
+/**
+ * The fee policy a run replays under, as both harnesses read it from the job.
+ *
+ * The venue's schedule unless the manifest overrides it. `envFeeBps` is the
+ * operator's override (OT_FEE_BPS on the worker, --fee-bps for `ot run`) and
+ * wins over both, because it is how a run is reproduced under another
+ * assumption without editing the submission.
+ */
+export function feePolicyFor({ manifest, envFeeBps = null }) {
+  if (envFeeBps != null && envFeeBps !== '') {
+    const bps = Number(envFeeBps);
+    if (Number.isFinite(bps) && bps >= 0) return { mode: 'bps', bps };
+  }
+  if (manifest?.fee_bps != null) return { mode: 'bps', bps: manifest.fee_bps };
+  return { mode: 'venue' };
+}
+
+/**
+ * Validate a declared interval list, returning it normalised.
+ *
+ * Absent means the default (5m), not "everything": see MARKET_INTERVALS.
+ */
+export function normalizeIntervals(list) {
+  if (list == null) return [...DEFAULT_INTERVALS];
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new BacktestRejection('E_MANIFEST',
+      `intervals must be a non-empty array; known: ${MARKET_INTERVALS.join(', ')}`);
+  }
+  const out = [];
+  for (const raw of list) {
+    const iv = String(raw ?? '').trim();
+    if (!MARKET_INTERVALS.includes(iv)) {
+      throw new BacktestRejection('E_MANIFEST',
+        `unknown interval ${JSON.stringify(iv)}; known: ${MARKET_INTERVALS.join(', ')}`);
+    }
+    if (!out.includes(iv)) out.push(iv);
+  }
+  // Sorted so the same request always produces the same decoded-cache identity.
+  return out.sort();
+}
+
+/** Validate a declared dataset list, returning it normalised. */
+export function normalizeDatasets(list) {
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new BacktestRejection('E_MANIFEST', 'datasets must be a non-empty array');
+  }
+  const out = [];
+  for (const raw of list) {
+    const ds = String(raw ?? '').trim();
+    if (!KNOWN_DATASETS.includes(ds) && !DERIVED_DATASETS[ds]) {
+      throw new BacktestRejection('E_MANIFEST',
+        `unknown dataset ${JSON.stringify(ds)}; known: ${[...KNOWN_DATASETS, ...Object.keys(DERIVED_DATASETS)].join(', ')}`);
+    }
+    if (!out.includes(ds)) out.push(ds);
+  }
+  return out;
+}
+
+/**
+ * The dataset list the prewarm decodes for.
+ *
+ * A decoded day is cached per dataset SHAPE, so warming a shape nobody submits
+ * warms nothing at all — the paid run still pays the full decode. This is the
+ * shape the editor submits: every dataset it offers as a chip, which is what
+ * almost every run declares.
+ *
+ * Derived from the contract, not written out, so a dataset added to the
+ * product is warmed without anyone remembering to come here.
+ */
+const SETTLEMENT_STREAMS = new Set(['prices', 'twap30s', 'twap60s']);
+export const PREWARM_DATASETS = Object.freeze(
+  KNOWN_DATASETS.filter((d) => !SETTLEMENT_STREAMS.has(d) && !OPT_IN_DATASETS.includes(d)),
+);
+
+/**
+ * EVERY dataset shape worth warming: the default one, plus the default one with
+ * each opt-in dataset added.
+ *
+ * A decoded day is cached per SHAPE, so warming only the default leaves every
+ * opted-in run paying the full decode — the timer stays green, the cache grows,
+ * and the one customer who asked for more waits longest. That is the failure
+ * this file already documents for the default shape; an opt-in dataset just
+ * moves it one step along.
+ *
+ * The cost is bounded and mostly imaginary: on a day the opt-in dataset is not
+ * captured, `archiveDatasetsForDay` drops it, both shapes normalise to the same
+ * archive files, and the second warm is a cache HIT rather than a second copy.
+ * Only days that actually carry it are stored twice.
+ *
+ * Derived, so a dataset added to the product is warmed without anyone
+ * remembering to come here.
+ */
+export const PREWARM_SHAPES = Object.freeze([
+  PREWARM_DATASETS,
+  ...OPT_IN_DATASETS.map((d) => Object.freeze([...PREWARM_DATASETS, d])),
+]);

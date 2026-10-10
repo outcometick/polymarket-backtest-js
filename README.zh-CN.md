@@ -1,0 +1,127 @@
+<!-- Generated from the outcometick monorepo by scripts/publish-backtest-repo.mjs. Edits here are overwritten; open an issue or a PR and it is ported back. -->
+# outcometick 回测 · JavaScript / TypeScript
+
+**用 JavaScript 对 Polymarket 与 Predict.fun 加密货币涨跌市场做逐笔回测。** 写一个策略类，用 `ot` 命令行在本地按归档的真实盘口重放；
+想跑完整区间时，把同一份文件提交到[托管回测](https://outcometick.com/zh/backtest)。每个市场都按它实际使用的 Chainlink 结算流
+以 1 美元 / 0 美元结算，每一笔成交都扣平台的吃单手续费。
+
+[English](README.md) · **简体中文** · [方法说明](docs/methodology.md)（英文） · [我们怎么验证](docs/verification.md)（英文） ·
+Python 版：[polymarket-backtest](https://github.com/outcometick/polymarket-backtest)
+
+> 出自 [outcometick.com](https://outcometick.com/zh)：这里重放的 Polymarket 与 Predict.fun 逐笔数据归档来自那里，
+> 托管回测用的也是这个引擎。[详见下文。](#outcometickcom-上还有什么)
+
+```bash
+npm i -g outcometick             # Node 24：ot 命令行、策略 SDK、数据客户端
+ot init my-strategy --template favourite-near-close --lang nodejs
+curl -L https://github.com/outcometick/polymarket-tick-data-samples/releases/latest/download/polymarket-data-samples.tar.gz | tar xz
+ot check my-strategy             # 和托管队列完全相同的校验器
+ot run my-strategy --data ./polymarket-data-samples
+```
+
+一个策略就是一个类加一份清单：
+
+```js
+// my-strategy/strategy.mjs
+import { Strategy, Order } from "outcometick";
+
+export default class Favourite extends Strategy {
+  onMarketOpen(ctx, market) {
+    this.close = market.close_ts_ms;
+    this.done = false;
+  }
+
+  onTick(ctx, tick) {
+    if (this.done || this.close - ctx.now > 60_000) return null;
+    const book = ctx.book();
+    const up = book.best("UP");
+    const down = book.best("DOWN");
+    if (up == null || down == null) return null;
+    this.done = true;
+    const [side, price] = up >= down ? ["UP", up] : ["DOWN", down];
+    if (price < 0.55 || price > 0.95) return null;
+    return new Order({ side, notional: 50, limit: 0.95 });
+  }
+}
+```
+
+```json
+{
+  "schema": 1,
+  "language": "nodejs@24",
+  "entry": "strategy.mjs:Favourite",
+  "hooks": ["on_market_open", "on_tick"],
+  "datasets": ["settlement", "book"],
+  "intervals": ["5m"]
+}
+```
+
+`ot run` 会打印主要指标，并把完整结果（报告 JSON、全部成交和 fill 的 CSV、日志、校验和）写成一个 zip，可以直接拿到 notebook 里用。
+确认没问题后：
+
+```bash
+export OT_BACKTEST_KEY=bt_...          # 在 outcometick.com/zh/backtest 获取
+ot submit my-strategy --assets btc,eth --days 30
+ot status run_...                      # 完成后：ot fetch run_...
+```
+
+## 它做对了什么
+
+**结算按平台规则，不做近似。** Polymarket 的加密市场在一条 Chainlink 流上结算：瞬时流、30 秒 TWAP 或 60 秒 TWAP，用哪条写在
+市场自己的配置里（`twapLookbackSeconds`），不按日期推。每个市场都对着自己的结算流重放，按官方结果兑付 1 美元或 0 美元；
+Predict.fun 平局按 50:50 兑付。读不出结算流或结果的市场会被剔除并在报告里列出，绝不靠猜来结算。
+
+**每个市场两本盘口。** UP 和 DOWN 是两个代币，各有自己的买卖档位。买 UP 吃 UP 的卖档，平仓卖进 UP 的买档。
+（Predict.fun 每个市场只发布一本盘口，所以它的 DOWN 一侧是 UP 的镜像。）
+
+**按当时挂着的深度逐档成交。** 订单对着那一毫秒重建出的盘口逐档成交，盘口里没有的数量记为未成交，不会按最优价全部成交。
+清单里写 `"latency": 250`，每笔订单就按它实际到达时的盘口成交，限价照样保护它。
+
+**按市场收平台吃单费。** Polymarket 向吃单方收取 `C × rate × p × (1 − p)`，每个市场的费率表都在归档里，每一笔模拟成交都会扣。
+报告写明用了哪种手续费模型、有多少个市场读不到费率表。有一点是估算，报告里也写明了：平台按每笔撮合的挂单分别取整，
+归档里只有档位，所以这里按吃掉的每个档位计算并取整。清单里写 `"fee_bps"` 可以改成统一费率。
+
+**结构上就看不到未来。** 事件一条一条地交给策略，当天剩下的数据不在进程里；市场的 `outcome` 在 `onSettle` 之前不可见。
+session 模式下，时间上重叠的市场按同一条时间线交错重放，跨市场保留的状态不会跑到时钟前面去。
+
+**本地和托管是同一套代码。** `ot run` 用的解码、引擎、harness 和报告就是托管队列用的那一套，`ot check` 就是队列自己的校验器：
+它接受的策略，提交时不会因为校验差异被拒。JavaScript 和 Python 两个引擎逐笔互相核对。详见[我们怎么验证](docs/verification.md)。
+
+**为二元市场设计的报告。** Brier 分数、按入场价分桶的校准、每份合约的边际、峰值占用资金、滑点面板，以及同样下单规模的朴素基准：
+一直买 UP、一直买 DOWN、开盘时一直买热门。如果策略连「买热门」都跑不赢，报告第一页就会告诉你。
+
+**对数据坦白。** 盘口由按固定节奏采集的快照和增量重建；不抽稀的最优买卖价流只能删掉已被越过的档位，不能凭空添加。
+每个没能重放的市场日都会列出原因。
+
+## 包里还有
+
+- **`outcometick/data`**：数据订阅客户端（列文件、下载并校验 sha256），以及 `OrderBook`，用归档的 `book`、`price_change`、
+  `best_bid_ask` 行重建 Polymarket 盘口。
+- **`ot mcp`**：MCP 服务，Claude Code、Cursor 可以查归档、下载文件、在本地检查策略；它从不提交回测。
+- SDK 和数据客户端的 TypeScript 类型声明。
+
+## 限制
+
+- 订单只吃单（IOC）。挂单需要排队位置模型，随便猜一个会把做市收益夸大好几倍，所以宁可拒绝也不近似。保守的排队模型是下一步。
+- 只有 5 分钟和 15 分钟的加密货币涨跌市场，也就是归档里有的那些。
+- 币安参考价流在托管机器上，读它的策略只能提交，不能在本地跑。
+- 一个样本日说明不了下个月。相信任何数字之前，先在一段时间范围上回测。
+
+## outcometick.com 上还有什么
+
+- **数据本身。** [Polymarket 与 Predict.fun 加密涨跌市场的逐笔归档](https://outcometick.com/zh)：盘口快照与增量、成交、
+  最优买卖价、市场元数据，以及市场结算所用的 Chainlink 价格流，按天发布。`ot run --data` 可以直接读下载好的某一天。
+  免费样本在 [GitHub](https://github.com/outcometick/polymarket-tick-data-samples)、Kaggle 和 Hugging Face 上也有。
+- **托管回测。** [outcometick.com/zh/backtest](https://outcometick.com/zh/backtest)：网页编辑器或 `ot submit`，在我们的机器上用最近几周的数据跑，
+  什么都不用下载；按扫描的市场日计费，没有产出报告的运行不收费。
+- **结算审计。** [逐个市场](https://outcometick.com/zh/polymarket-settlement-audit)用归档的 Chainlink 流重算结算结果，并和平台的结果对比。
+
+## 仓库结构
+
+npm 包 `outcometick` 的源码和测试（`npm install && npm test`）：`ot` 命令行（`cli/`）、引擎和 harness（`runner/`）、共用的归档解码和契约
+（`runner/events.mjs`、`api/lib/`）、数据客户端（`client/`）、策略模板（`templates/`）。`examples/` 是可运行的策略。
+
+由 outcometick 主仓库生成，托管回测跑的也是这套代码；npm 发布在
+[outcometick-sdk-ts](https://github.com/outcometick/outcometick-sdk-ts)。欢迎在这里提 issue 和 PR。
+
+许可证：MIT。

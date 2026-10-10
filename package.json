@@ -1,0 +1,64 @@
+{
+  "name": "outcometick",
+  "version": "2.2.1",
+  "description": "Strategy SDK and CLI for outcometick prediction-market backtests",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://outcometick.com/docs/sdk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/outcometick/outcometick-sdk-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/outcometick/outcometick-sdk-ts/issues"
+  },
+  "bin": {
+    "ot": "./bin/ot.mjs"
+  },
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    },
+    "./data": {
+      "types": "./client/data.d.ts",
+      "default": "./client/data.mjs"
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "api",
+    "bin",
+    "cli",
+    "client",
+    "index.d.ts",
+    "index.mjs",
+    "runner",
+    "templates",
+    "!**/*.test.mjs",
+    "!**/*.test-d.ts"
+  ],
+  "scripts": {
+    "test": "node --test runner/analyze/*.test.mjs runner/engine/*.test.mjs runner/harness/node/*.test.mjs cli/*.test.mjs client/*.test.mjs"
+  },
+  "dependencies": {
+    "acorn": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "peerDependenciesMeta": {
+    "danfojs-node": {
+      "optional": true
+    },
+    "mathjs": {
+      "optional": true
+    },
+    "decimal.js": {
+      "optional": true
+    }
+  }
+}

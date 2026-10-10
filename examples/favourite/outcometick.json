@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "language": "nodejs@24",
+  "entry": "strategy.mjs:Favourite",
+  "hooks": ["on_market_open", "on_tick"],
+  "datasets": ["settlement", "book"],
+  "intervals": ["5m"]
+}

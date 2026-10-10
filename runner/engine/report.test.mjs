@@ -1,0 +1,549 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  metrics, brier, edgePerContract, equityCurve, maxDrawdown, worstLosingRun,
+  calibration, baselines, slippage, splitByMarket, sweepPanel,
+  buildReport, fillStats, slippageAccumulator,
+} from './report.mjs';
+
+const day = (d) => Date.parse(`2026-07-${String(d).padStart(2, '0')}T12:00:00Z`);
+
+/** A settled trade. `won` decides the outcome relative to the side taken. */
+const settled = ({ px, size = 100, won, d = 1, side = 'UP', market = '0xa' }) => ({
+  market_id: market,
+  side,
+  size,
+  entry_px: px,
+  exit_px: won ? 1 : 0,
+  pnl: (won ? 1 - px : -px) * size,
+  fees: 0,
+  opened_ms: day(d) - 60_000,
+  closed_ms: day(d),
+  how: 'settled',
+  outcome: won ? side : (side === 'UP' ? 'DOWN' : 'UP'),
+});
+
+// ---------------------------------------------------------------------------
+// headline metrics
+// ---------------------------------------------------------------------------
+
+test('net pnl, win rate and trade count come straight off the trades', () => {
+  const trades = [
+    settled({ px: 0.5, won: true, d: 1 }),
+    settled({ px: 0.5, won: false, d: 2 }),
+    settled({ px: 0.4, won: true, d: 3 }),
+  ];
+  const m = metrics(trades);
+  assert.equal(m.trades, 3);
+  assert.equal(m.net_pnl, 50 - 50 + 60);
+  assert.equal(m.win_rate, 0.6667);
+});
+
+test('profit factor is gross win over gross loss, and blank with no losses', () => {
+  const winners = [settled({ px: 0.5, won: true, d: 1 }), settled({ px: 0.5, won: true, d: 2 })];
+  // Infinity would print as a number nobody can compare; a blank is honest.
+  assert.equal(metrics(winners).profit_factor, null);
+
+  const mixed = [...winners, settled({ px: 0.5, won: false, d: 3 })];
+  assert.equal(metrics(mixed).profit_factor, 2);
+});
+
+test('an empty run reports blanks rather than zeros that look like results', () => {
+  const m = metrics([]);
+  assert.equal(m.trades, 0);
+  assert.equal(m.net_pnl, 0);
+  assert.equal(m.win_rate, null);
+  assert.equal(m.sharpe, null);
+  assert.equal(m.brier_score, null);
+  assert.equal(m.return_on_collateral, null);
+});
+
+test('return on collateral divides by what was actually tied up', () => {
+  // 100 contracts at 0.50 = $50 deployed, $50 made.
+  const m = metrics([settled({ px: 0.5, won: true, d: 1 })]);
+  assert.equal(m.collateral_deployed, 50);
+  assert.equal(m.return_on_collateral, 1);
+});
+
+test('fees are reported as a negative number', () => {
+  assert.equal(metrics([], { feesPaid: 188 }).fees, -188);
+  assert.equal(metrics([], { feesPaid: -188 }).fees, -188);
+});
+
+// ---------------------------------------------------------------------------
+// scoring the forecast
+// ---------------------------------------------------------------------------
+
+test('brier scores the price as a forecast', () => {
+  // Paid 0.5 and won: (0.5 - 1)^2 = 0.25. Paid 0.5 and lost: same.
+  // brier() returns the raw value so it can feed further arithmetic; metrics()
+  // is the layer that rounds for display.
+  const b = (t) => Number(brier(t).toFixed(4));
+  assert.equal(b([settled({ px: 0.5, won: true, d: 1 })]), 0.25);
+  // A confident, correct call scores well.
+  assert.equal(b([settled({ px: 0.9, won: true, d: 1 })]), 0.01);
+  // A confident, wrong one scores badly.
+  assert.equal(b([settled({ px: 0.9, won: false, d: 1 })]), 0.81);
+  assert.equal(brier([]), null);
+  assert.equal(metrics([settled({ px: 0.9, won: true, d: 1 })]).brier_score, 0.01);
+});
+
+test('edge per contract is realised outcome minus price paid', () => {
+  assert.equal(Number(edgePerContract([settled({ px: 0.4, won: true, d: 1 })]).toFixed(4)), 0.6);
+  assert.equal(Number(edgePerContract([settled({ px: 0.4, won: false, d: 1 })]).toFixed(4)), -0.4);
+});
+
+test('trades closed before settlement are excluded from edge and brier', () => {
+  // Exiting early is edge against the market, not against the truth. Scoring
+  // it as a forecast would be measuring something that never resolved.
+  const early = {
+    market_id: '0xa', side: 'UP', size: 100, entry_px: 0.5, exit_px: 0.6,
+    pnl: 10, fees: 0, opened_ms: day(1) - 1000, closed_ms: day(1), how: 'exit',
+  };
+  assert.equal(brier([early]), null);
+  assert.equal(edgePerContract([early]), 0);
+  // ...but it still counts toward PnL and the trade count.
+  assert.equal(metrics([early]).net_pnl, 10);
+  assert.equal(metrics([early]).trades, 1);
+});
+
+// ---------------------------------------------------------------------------
+// equity and drawdown
+// ---------------------------------------------------------------------------
+
+test('the equity curve accumulates in close order, not submission order', () => {
+  const curve = equityCurve([
+    { pnl: 10, closed_ms: 300 },
+    { pnl: -5, closed_ms: 100 },
+    { pnl: 20, closed_ms: 200 },
+  ]);
+  assert.deepEqual(curve.map((p) => p.equity), [-5, 15, 25]);
+});
+
+test('drawdown is measured against the running peak', () => {
+  const dd = maxDrawdown([0, 100, 60, 120, 40]);
+  assert.equal(dd.abs, 80);          // 120 -> 40
+  assert.equal(Number(dd.pct.toFixed(4)), -0.6667);
+});
+
+test('a curve that never turns positive reports an absolute decline only', () => {
+  // Dividing by a peak of zero would print a percentage in the thousands.
+  const dd = maxDrawdown([0, -10, -50]);
+  assert.equal(dd.abs, 50);
+  assert.equal(dd.pct, null);
+});
+
+test('the worst losing run counts consecutive losers', () => {
+  assert.equal(worstLosingRun([1, -1, -1, -1, 2, -1, -1]), 3);
+  assert.equal(worstLosingRun([1, 2, 3]), 0);
+  assert.equal(worstLosingRun([]), 0);
+});
+
+test('sharpe needs more than one day of returns', () => {
+  const oneDay = [settled({ px: 0.5, won: true, d: 1 })];
+  assert.equal(metrics(oneDay).sharpe, null);
+
+  const spread = [
+    settled({ px: 0.5, won: true, d: 1 }),
+    settled({ px: 0.5, won: false, d: 2 }),
+    settled({ px: 0.4, won: true, d: 3 }),
+  ];
+  assert.ok(Number.isFinite(metrics(spread).sharpe));
+});
+
+// ---------------------------------------------------------------------------
+// calibration
+// ---------------------------------------------------------------------------
+
+test('calibration compares what was paid with what settled', () => {
+  // Four trades in the 0.4-0.5 bucket, three of which won.
+  const trades = [
+    settled({ px: 0.45, won: true, d: 1 }),
+    settled({ px: 0.45, won: true, d: 2 }),
+    settled({ px: 0.45, won: true, d: 3 }),
+    settled({ px: 0.45, won: false, d: 4 }),
+  ];
+  const rows = calibration(trades);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].bucket, '0.40-0.50');
+  assert.equal(rows[0].implied, 0.45);
+  assert.equal(rows[0].realized, 0.75);
+  assert.equal(rows[0].edge_cents, 30);
+  assert.equal(rows[0].trades, 4);
+});
+
+test('empty buckets are omitted, not reported as zero edge', () => {
+  const rows = calibration([settled({ px: 0.55, won: true, d: 1 })]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].bucket, '0.50-0.60');
+});
+
+// ---------------------------------------------------------------------------
+// baselines
+// ---------------------------------------------------------------------------
+
+test('naive baselines price the same markets the strategy saw', () => {
+  const markets = [
+    { outcome: 'UP', up_px: 0.40, down_px: 0.62 },
+    { outcome: 'DOWN', up_px: 0.55, down_px: 0.47 },
+  ];
+  const b = baselines(markets, { size: 1 });
+  // always UP: (1-0.40) + (0-0.55) = 0.05
+  assert.equal(b.always_up, 0.05);
+  // always DOWN: (0-0.62) + (1-0.47) = -0.09
+  assert.equal(b.always_down, -0.09);
+  // The favourite is the DEARER side, because on a binary market the price is
+  // the implied probability. Market 1: DOWN at 0.62 (lost). Market 2: UP at
+  // 0.55 (lost). This test previously codified the inverted version, which is
+  // how the panel came to compare strategies against buying the underdog.
+  assert.equal(b.always_favourite, Number(((0 - 0.62) + (0 - 0.55)).toFixed(2)));
+});
+
+test('the favourite is the side the market thinks will win', () => {
+  // A market priced UP 0.70 / DOWN 0.30 that settles UP: buying the favourite
+  // made money. The inverted version reported a loss of 0.30 on a call the
+  // market got right.
+  const b = baselines([{ outcome: 'UP', up_px: 0.70, down_px: 0.30 }], { size: 1 });
+  assert.equal(b.always_favourite, 0.30);
+
+  const lost = baselines([{ outcome: 'DOWN', up_px: 0.70, down_px: 0.30 }], { size: 1 });
+  assert.equal(lost.always_favourite, -0.70);
+});
+
+// A 50:50 settlement pays 0.5 on both sides, so it scores as 0.5 everywhere a
+// won/lost 1/0 used to go — never as a win or a loss.
+test('a TIE scores 0.5 in edge, brier, calibration and every baseline', () => {
+  const tie = (px) => ({
+    market_id: '0xa', side: 'UP', size: 100, entry_px: px, exit_px: 0.5,
+    pnl: (0.5 - px) * 100, fees: 0, opened_ms: day(1) - 60_000, closed_ms: day(1),
+    how: 'settled', outcome: 'TIE',
+  });
+  assert.equal(Number(edgePerContract([tie(0.4)]).toFixed(4)), 0.1);
+  assert.equal(Number(brier([tie(0.9)]).toFixed(4)), 0.16);
+  const [row] = calibration([tie(0.45), settled({ px: 0.45, won: true, d: 2 })]);
+  assert.equal(row.realized, 0.75);
+
+  const b = baselines([{ outcome: 'TIE', up_px: 0.70, down_px: 0.32 }], { size: 1 });
+  assert.equal(b.always_up, -0.20);
+  assert.equal(b.always_down, 0.18);
+  assert.equal(b.always_favourite, -0.20);
+});
+
+test('markets with no outcome are skipped rather than counted as losses', () => {
+  const b = baselines([{ outcome: null, up_px: 0.4, down_px: 0.6 }]);
+  assert.equal(b.always_up, 0);
+});
+
+// ---------------------------------------------------------------------------
+// slippage
+// ---------------------------------------------------------------------------
+
+test('slippage separates paying up from not getting filled', () => {
+  const fills = [
+    { action: 'open', requested: 100, filled: 100, unfilled: 0, quoted_px: 0.50, avg_px: 0.50, levels_walked: 1 },
+    { action: 'open', requested: 100, filled: 100, unfilled: 0, quoted_px: 0.50, avg_px: 0.52, levels_walked: 3 },
+    { action: 'open', requested: 100, filled: 0, unfilled: 100, quoted_px: 0.50, avg_px: null, levels_walked: 0 },
+    { action: 'open', requested: 100, filled: 100, unfilled: 0, quoted_px: 0.50, avg_px: 0.51, levels_walked: 2 },
+  ];
+  const s = slippage(fills);
+  assert.equal(s.orders, 4);
+  assert.equal(s.fills_at_quote, 0.25);
+  assert.equal(s.partial_fills, 0.5);
+  assert.equal(s.unfilled, 0.25);
+  // Money not kept, so negative.
+  assert.equal(s.pnl_lost_to_slippage, -3);
+  assert.equal(s.unfilled_size_ratio, 0.25);
+});
+
+test('exits are not counted as slippage on entry', () => {
+  const s = slippage([
+    { action: 'reduce', requested: 100, filled: 100, unfilled: 0, quoted_px: 0.49, avg_px: 0.49, levels_walked: 1 },
+  ]);
+  assert.equal(s.orders, 0);
+  assert.equal(s.fills_at_quote, null);
+});
+
+// ---------------------------------------------------------------------------
+// panels
+// ---------------------------------------------------------------------------
+
+test('the split groups by asset and market period', () => {
+  const meta = new Map([
+    ['0xa', { asset: 'BTC', interval: '1h' }],
+    ['0xb', { asset: 'ETH', interval: '15m' }],
+  ]);
+  const rows = splitByMarket([
+    { market_id: '0xa', pnl: 100 },
+    { market_id: '0xa', pnl: 50 },
+    { market_id: '0xb', pnl: -20 },
+  ], meta);
+  assert.deepEqual(rows, [
+    { name: 'BTC 1h', pnl: 150, trades: 2 },
+    { name: 'ETH 15m', pnl: -20, trades: 1 },
+  ]);
+});
+
+
+test('the sweep grid is laid out by the two swept params', () => {
+  const cells = [];
+  for (const z of [1.0, 2.0]) {
+    for (const hold of [10, 20, 30]) {
+      cells.push({ params: { entry_z: z, hold_minutes: hold }, metrics: { sharpe: z * hold / 10 } });
+    }
+  }
+  const s = sweepPanel(cells, { xParam: 'hold_minutes', yParam: 'entry_z', metric: 'sharpe' });
+  assert.deepEqual(s.x_labels, [10, 20, 30]);
+  assert.deepEqual(s.y_labels, [1.0, 2.0]);
+  assert.deepEqual(s.grid, [[1, 2, 3], [2, 4, 6]]);
+  assert.equal(s.max, 6);
+  assert.equal(s.cells, 6);
+});
+
+test('a sweep with a missing cell leaves a hole rather than a zero', () => {
+  const s = sweepPanel([
+    { params: { a: 1, b: 1 }, metrics: { sharpe: 5 } },
+    { params: { a: 2, b: 2 }, metrics: { sharpe: 7 } },
+  ], { xParam: 'a', yParam: 'b', metric: 'sharpe' });
+  assert.deepEqual(s.grid, [[5, null], [null, 7]]);
+});
+
+// ---------------------------------------------------------------------------
+// assembly
+// ---------------------------------------------------------------------------
+
+test('the report carries coverage through untouched', () => {
+  const coverage = { days: [{ day: '2026-07-01', stream: 'prices', gaps: 0 }] };
+  const r = buildReport({
+    runId: 'run_abc123',
+    submittedAt: 1,
+    manifest: { schema: 1, language: 'python@3.14', mode: 'market' },
+    scope: { venue: 'polymarket', assets: ['BTC'], from: '2026-07-01', to: '2026-07-01', archivedDayCount: 1 },
+    trades: [settled({ px: 0.5, won: true, d: 1 })],
+    fillStats: fillStats([]),
+    marketSummaries: [],
+    coverage,
+  });
+  assert.deepEqual(r.coverage, coverage, 'coverage is what makes the rest checkable');
+  assert.equal(r.run_id, 'run_abc123');
+  assert.equal(r.metrics.net_pnl, 50);
+});
+
+test('a clean cross-check and a missing one look different', () => {
+  const base = {
+    runId: 'r', submittedAt: 1, manifest: {}, scope: {},
+    trades: [settled({ px: 0.5, won: true, d: 1 })], fillStats: fillStats([]), marketSummaries: [],
+  };
+  const none = buildReport(base);
+  assert.equal(none.crosscheck.recompute_checks, 0);
+  assert.equal(none.crosscheck.mismatches, 0);
+
+  const bad = buildReport({ ...base, crosschecks: [{ match: true }, { match: false }] });
+  assert.equal(bad.crosscheck.recompute_matches, 1);
+  assert.equal(bad.crosscheck.mismatches, 1);
+});
+
+
+
+
+
+// A run replays ONCE, at whatever fill delay the submitter asked for. There is
+// no comparison table any more: five extra replays took five sixths of the
+// wall clock, and the sampled version that replaced them was an extrapolation
+// dressed as a measurement.
+//
+// So the delay has to be IN the report. It changes every number in it — the
+// same strategy over the same days at 0ms and at 250ms produces two different
+// reports that are otherwise indistinguishable, and a reader with the archive
+// in front of them would have no way to tell which one they have.
+test('the report says which fill delay it was measured at', () => {
+  const base = {
+    runId: 'run_abc123',
+    submittedAt: 1,
+    manifest: { schema: 1, language: 'python@3.14', mode: 'market' },
+    scope: { venue: 'polymarket', assets: ['BTC'], from: '2026-07-01', to: '2026-07-01', archivedDayCount: 1 },
+    trades: [settled({ px: 0.5, won: true, d: 1 })],
+    fillStats: fillStats([]),
+    marketSummaries: [],
+  };
+  assert.equal(buildReport({ ...base, fillDelayMs: 250 }).fill_delay_ms, 250);
+  // Zero is a REPORTED value, not an absent one: "measured with no delay" and
+  // "we did not record the delay" must not look the same.
+  assert.equal(buildReport({ ...base, fillDelayMs: 0 }).fill_delay_ms, 0);
+  assert.equal(buildReport(base).fill_delay_ms, 0);
+  // And the comparison table is gone rather than empty.
+  assert.equal('latency' in buildReport(base), false,
+    'the report still carries a latency panel that nothing produces');
+});
+
+// ---------------------------------------------------------------------------
+// "how much money do I need to run this"
+// ---------------------------------------------------------------------------
+//
+// The report could not answer it. It divided P&L by the SUM of every entry,
+// and a strategy that recycles one stake a thousand times has a sum a thousand
+// times larger than the stake — so a run that burned through its money
+// thirty-nine times over reported −4.35%.
+
+test('peak capital is what was at risk AT ONCE, not the sum of entries', async () => {
+  const { metrics } = await import('./report.mjs');
+  // Three sequential positions, $80 each. The money is the same $80 three
+  // times over, and a strategy needing $240 is a different strategy.
+  const seq = [0, 1, 2].map((i) => ({
+    market_id: `m${i}`, pnl: -10, entry_px: 0.4, size: 200,
+    opened_ms: 1000 + i * 1000, closed_ms: 1500 + i * 1000,
+  }));
+  const m = metrics(seq);
+  assert.equal(m.collateral_deployed, 240, 'the sum of entries');
+  assert.equal(m.peak_capital, 80, 'but only $80 was ever at risk');
+  // And the two returns differ by exactly that factor.
+  assert.equal(m.return_on_collateral, -0.125);
+  assert.equal(m.return_on_peak, -0.375);
+});
+
+test('overlapping positions DO add up', async () => {
+  const { metrics } = await import('./report.mjs');
+  const overlap = [
+    { market_id: 'a', pnl: -1, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 3000 },
+    { market_id: 'b', pnl: -1, entry_px: 0.5, size: 100, opened_ms: 1000, closed_ms: 2000 },
+  ];
+  assert.equal(metrics(overlap).peak_capital, 100, 'two concurrent $50 stakes need $100');
+});
+
+test('a position that ends where the next begins needs one stake, not two', async () => {
+  const { metrics } = await import('./report.mjs');
+  // Closes are processed before opens at the same instant. Getting this
+  // backwards doubles the answer for any strategy that trades back to back —
+  // which is most of them.
+  const backToBack = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 1000 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 1000, closed_ms: 2000 },
+  ];
+  assert.equal(metrics(backToBack).peak_capital, 50);
+});
+
+test('a trade with no timestamps is skipped, not assumed concurrent', async () => {
+  const { metrics } = await import('./report.mjs');
+  // An unknown that inflated the peak would make a strategy look SAFER to
+  // fund than it is, which is the wrong direction to be wrong in.
+  const mixed = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 100, opened_ms: 0, closed_ms: 1000 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 100 },
+  ];
+  assert.equal(metrics(mixed).peak_capital, 50);
+});
+
+test('time in market is the UNION of the positions, never their sum', async () => {
+  const { metrics } = await import('./report.mjs');
+  // Two overlapping hour-long positions are one hour of being in the market.
+  // Summing them can exceed the span and report over 100%.
+  const overlap = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 0, closed_ms: 100 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 50, closed_ms: 100 },
+  ];
+  assert.equal(metrics(overlap).holding_ratio, 1);
+
+  const gap = [
+    { market_id: 'a', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 0, closed_ms: 25 },
+    { market_id: 'b', pnl: 0, entry_px: 0.5, size: 2, opened_ms: 75, closed_ms: 100 },
+  ];
+  assert.equal(metrics(gap).holding_ratio, 0.5, 'half the span had a position open');
+});
+
+test('no trades produces nulls, not zeros pretending to be answers', async () => {
+  const { metrics } = await import('./report.mjs');
+  const m = metrics([]);
+  assert.equal(m.return_on_peak, null);
+  assert.equal(m.holding_ratio, null);
+  assert.equal(m.peak_capital, 0);
+});
+
+// ---------------------------------------------------------------------------
+// report.json must not grow with the trade count
+// ---------------------------------------------------------------------------
+
+import { downsampleEquity, EQUITY_MAX_POINTS, TRADES_HEAD } from './report.mjs';
+
+test('downsampleEquity keeps both ends and every bucket extreme, and stays under the cap', () => {
+  // A deep, one-point trough in the middle: a stride would step over it and
+  // the drawn curve would show less drawdown than the metric above it.
+  const pts = Array.from({ length: 100_000 }, (_, i) => ({ ts_ms: i, equity: i }));
+  pts[54_321] = { ts_ms: 54_321, equity: -1e6 };
+  pts[77_777] = { ts_ms: 77_777, equity: 1e7 };
+  const out = downsampleEquity(pts);
+  assert.ok(out.length <= EQUITY_MAX_POINTS, `${out.length} points`);
+  assert.equal(out[0], pts[0]);
+  assert.equal(out.at(-1), pts.at(-1));
+  assert.ok(out.includes(pts[54_321]), 'the trough survives');
+  assert.ok(out.includes(pts[77_777]), 'the peak survives');
+  for (let i = 1; i < out.length; i++) assert.ok(out[i].ts_ms > out[i - 1].ts_ms, 'order kept, no duplicates');
+  const short = pts.slice(0, EQUITY_MAX_POINTS);
+  assert.equal(downsampleEquity(short), short, 'a curve under the cap is untouched');
+});
+
+test('the report carries counts and a head, not the full trade and fill lists', () => {
+  const trades = Array.from({ length: 3000 }, (_, i) => settled({ px: 0.5, won: i % 2 === 0, d: 1 + (i % 20), market: `0x${i}` }));
+  const fills = trades.map((t) => ({ ts_ms: t.opened_ms, market_id: t.market_id, side: 'UP', action: 'open',
+    requested: 100, filled: 100, unfilled: 0, avg_px: 0.5, worst_px: 0.5, quoted_px: 0.5, levels_walked: 1, fee: 0, realised: 0 }));
+  const r = buildReport({
+    runId: 'r', submittedAt: 1, manifest: {}, scope: { archivedDayCount: 20 }, trades, fillStats: fillStats(fills), marketSummaries: [],
+  });
+  assert.equal(r.trades, undefined, 'renamed, so an old reader fails loudly instead of summing a preview');
+  assert.equal(r.fills, undefined);
+  assert.equal(r.trades_head.length, TRADES_HEAD);
+  assert.deepEqual(r.trades_head, trades.slice(0, TRADES_HEAD));
+  assert.deepEqual(r.rows, { trades: 3000, fills: 3000, equity_points: 3000 });
+  assert.ok(r.equity.length <= EQUITY_MAX_POINTS);
+  // Aggregates still come from every row, not from the head.
+  assert.equal(r.metrics.trades, 3000);
+  assert.equal(r.slippage.orders, 3000);
+  const full = equityCurve(trades.filter((t) => Number.isFinite(t.pnl)));
+  assert.equal(r.equity.at(-1).equity, Number(full.at(-1).equity.toFixed(2)), 'curve ends where the full one does');
+});
+
+test('a report over 400k trades builds without blowing the argument limit', () => {
+  // Math.min(...rows) threw RangeError here long before memory ran out.
+  const trades = Array.from({ length: 400_000 }, (_, i) => settled({ px: 0.5, won: i % 2 === 0, d: 1 + (i % 28) }));
+  const r = buildReport({ runId: 'r', submittedAt: 1, manifest: {}, scope: { archivedDayCount: 28 }, trades, fillStats: fillStats([]), marketSummaries: [] });
+  assert.equal(r.rows.trades, 400_000);
+  assert.ok(Number.isFinite(r.metrics.holding_ratio));
+});
+
+test('the streaming slippage panel equals the array version, bit for bit', () => {
+  // The worker now feeds fills one at a time from disk. The panel it builds
+  // must be the one the array version built — same sums in the same order.
+  const reference = (fills) => {
+    const attempted = fills.filter((f) => f.action === 'open');
+    if (!attempted.length) return null;
+    const add = (xs) => xs.reduce((a, b) => a + b, 0);
+    const slips = attempted.filter((f) => f.filled > 0 && f.quoted_px != null && f.avg_px != null)
+      .map((f) => (f.avg_px - f.quoted_px) * 100).sort((a, b) => a - b);
+    const at = (q) => (slips.length ? slips[Math.min(slips.length - 1, Math.floor(q * slips.length))] : null);
+    const cost = add(attempted.filter((f) => f.filled > 0 && f.quoted_px != null && f.avg_px != null)
+      .map((f) => (f.avg_px - f.quoted_px) * f.filled));
+    const r = (x, d) => (Number.isFinite(x) ? Number(x.toFixed(d)) : null);
+    return {
+      orders: attempted.length,
+      fills_at_quote: r(attempted.filter((f) => f.filled > 0 && f.levels_walked === 1).length / attempted.length, 4),
+      partial_fills: r(attempted.filter((f) => f.filled > 0 && f.levels_walked > 1).length / attempted.length, 4),
+      unfilled: r(attempted.filter((f) => f.filled === 0).length / attempted.length, 4),
+      median_slippage_cents: r(at(0.5), 2),
+      worst_1pct_slippage_cents: r(at(0.99), 2),
+      pnl_lost_to_slippage: r(-cost, 2),
+      unfilled_size_ratio: r(add(attempted.map((f) => f.unfilled)) / add(attempted.map((f) => f.requested)), 4),
+    };
+  };
+  let seed = 3;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const fills = Array.from({ length: 5000 }, () => {
+    const requested = Math.ceil(rnd() * 50);
+    const filled = rnd() < 0.1 ? 0 : Math.ceil(rnd() * requested);
+    return {
+      action: rnd() < 0.8 ? 'open' : 'reduce', requested, filled, unfilled: requested - filled,
+      levels_walked: 1 + Math.floor(rnd() * 3), quoted_px: rnd() < 0.05 ? null : rnd(), avg_px: rnd(),
+    };
+  });
+  const acc = slippageAccumulator();
+  for (const f of fills) acc.add(f);
+  assert.deepEqual(acc.result(), reference(fills));
+  assert.deepEqual(fillStats(fills), { count: 5000, slippage: reference(fills) });
+});

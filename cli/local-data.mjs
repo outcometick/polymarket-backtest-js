@@ -1,0 +1,238 @@
+// Reading a cloned sample archive off disk, for `ot run`.
+//
+// The counterpart to runner/fetch-data.mjs, which reads the same archive out of
+// R2. Both go through runner/events.mjs for the row -> event mapping, because
+// the docs make a promise about exactly this pair:
+//
+//     The identical files, byte for byte, with the same checksums. A backtest
+//     here and a backtest on your own machine after subscribing read the same
+//     bytes — that is the point of offering it.
+//
+// Two decoders would make that false the first time they disagreed, and the
+// disagreement would be silent.
+
+import { createReadStream } from 'node:fs';
+import { readdir, stat } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
+import { pipeline } from 'node:stream/promises';
+import { createGunzip } from 'node:zlib';
+import path from 'node:path';
+
+import { classifyPath } from '../api/lib/data-taxonomy.mjs';
+import {
+  archiveDatasetsForDay, fileMatchesRun, normalizeIntervals, settlementPathsFor, orderedFeed,
+} from '../api/lib/backtest-datasets.mjs';
+import {
+  indexMarkets, parseRow, buildSlugIndex,
+  sortMarketsForReplay,
+  makeBookThrottle,
+} from '../runner/events.mjs';
+import { spoolDay } from '../runner/spool-day.mjs';
+
+/**
+ * Every file under a directory, as archive-relative paths.
+ *
+ * Symlinks are skipped rather than followed, in both directions: a symlinked
+ * directory is not descended into and a symlinked file is not read. `--data`
+ * points at a directory the user cloned from the internet, and git happily
+ * carries symlinks — so without this, a repo dressed up as sample data could
+ * name `~/.ssh/id_rsa` as a prices file and have `ot run` read it. Very little
+ * of an arbitrary file survives being parsed as archive rows, which makes this
+ * a poor exfiltration channel rather than a safe one; there is no reason to
+ * leave it open when the fix is to not follow the link.
+ *
+ * Regular files and real directories are all a genuine archive contains.
+ */
+async function walk(root, prefix = '', depth = 0) {
+  const out = [];
+  // A real archive is nested about six deep. The bound is what stops a
+  // symlink-free cycle or a pathologically deep tree from spinning here.
+  if (depth > 12) return out;
+  let entries;
+  try {
+    entries = await readdir(path.join(root, prefix), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const rel = prefix ? `${prefix}/${e.name}` : e.name;
+    if (e.isSymbolicLink()) continue;
+    if (e.isDirectory()) out.push(...await walk(root, rel, depth + 1));
+    else if (e.isFile()) out.push(rel);
+  }
+  return out;
+}
+
+/** Stream one local archive file, gunzipping if needed, yielding parsed rows. */
+async function* readRows(root, rel) {
+  const full = path.join(root, rel);
+  const raw = createReadStream(full);
+  // `pipeline`, not `raw.pipe(...)`, for the same reason the queue's reader
+  // uses it: `.pipe()` does not forward errors, so a failure on `raw` — a
+  // truncated file, a disk that went away mid-read — emits 'error' on a stream
+  // nobody is listening to, which in Node is process death rather than an
+  // exception. That exact shape killed the worker in production; the risk is
+  // lower on a local file, but the wrong pattern is not worth keeping a second
+  // copy of.
+  let stream = raw;
+  if (rel.endsWith('.gz')) {
+    const gunzip = createGunzip();
+    stream = gunzip;
+    pipeline(raw, gunzip).catch((err) => {
+      if (!gunzip.destroyed) gunzip.destroy(err);
+    });
+  } else {
+    raw.on('error', () => {});
+  }
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  const isCsv = rel.includes('.csv');
+  let header = null;
+  for await (const line of rl) {
+    const s = line.trim();
+    if (!s) continue;
+    if (isCsv && header === null) { header = s.split(','); continue; }
+    const row = parseRow(s, { isCsv, header });
+    if (row) yield row;
+  }
+}
+
+/**
+ * Which UTC day a sample archive path belongs to.
+ *
+ * The sample repos name files with the day in them, the same as the archive.
+ * A file we cannot date is skipped rather than guessed at — a mis-dated file
+ * would put one day's events into another day's market.
+ */
+export function dayOfPath(rel) {
+  const m = /(\d{4}-\d{2}-\d{2})/.exec(rel);
+  return m ? m[1] : null;
+}
+
+/**
+ * Load one day out of a local archive.
+ *
+ * Returns the same shape fetchMarketDays does, so `ot run` and the worker feed
+ * the harness identically.
+ */
+export async function loadLocalDay({ root, day, venue, assets, datasets, intervals, throttle = null, eventsDir }) {
+  // Day-scoped, and degrading datasets gated by their capture window — the
+  // same call the queue makes, because `ot run` and the worker have drifted
+  // apart nine times and every one of them was a rule computed twice.
+  const archiveDatasets = archiveDatasetsForDay({ datasets, venue, day, from: day, to: day });
+  // Same normalisation, same default, same two filters as the queue. `ot run`
+  // promises the identical files and checksums; an interval narrowing applied
+  // on one side only would break that on the very first 15m market.
+  const wantIntervals = normalizeIntervals(intervals ?? null);
+  const all = await walk(root);
+  const wanted = all.filter((rel) => dayOfPath(rel) === day
+    && fileMatchesRun(rel, { venue, assets, archiveDatasets, intervals: wantIntervals }));
+
+  if (wanted.length === 0) {
+    return { markets: [], reason: `no files for ${day} under ${root}` };
+  }
+
+  // Markets first: everything else is keyed by market, and the settlement
+  // stream resolution needs this.
+  const marketRows = [];
+  for (const rel of wanted.filter((r) => classifyPath(r).dataset === 'markets')) {
+    for await (const row of readRows(root, rel)) marketRows.push(row);
+  }
+  // Same normalisation the queue uses. `ot run` promising "the identical files,
+  // same checksums" only holds while both sides decode the archive identically,
+  // so the venue has to reach the decoder here too.
+  const indexed = indexMarkets(marketRows, { venue });
+  const inScope = new Set((assets ?? []).map((a) => String(a).toUpperCase()));
+  const wantIv = new Set(wantIntervals.map(String));
+  const markets = new Map();
+  for (const [id, m] of indexed) {
+    if (m.asset && inScope.size && !inScope.has(String(m.asset).toUpperCase())) continue;
+    if (m.interval && wantIv.size && !wantIv.has(String(m.interval))) continue;
+    markets.set(id, m);
+  }
+  if (markets.size === 0) {
+    return { markets: [], reason: `no market metadata for ${day}` };
+  }
+  const bySlug = buildSlugIndex(markets);
+
+  // The settlement files these markets need, from the SAME function the queue
+  // uses. Selecting them here separately is how "it runs locally but not in the
+  // queue" happens — and it had already happened: without this, a strategy
+  // asking for `prices` read nothing at all locally while the queue produced a
+  // report, off the identical archive.
+  const feed = orderedFeed([...wanted, ...settlementPathsFor(markets.values(),
+    all.filter((rel) => dayOfPath(rel) === day), { venue, assets, already: wanted })]);
+
+  // THE SAME SPOOL THE QUEUE USES — see spoolDay. This used to collect every
+  // event of the day in memory before replaying any of it; one day of Predict
+  // BTC is ~480k full-ladder snapshots, ~12KB each once parsed, and `ot run`
+  // died of a 4GB heap on the public sample. Each market's events go to their
+  // own file under `eventsDir`; `ot run` reads them back one market at a time.
+  const { out, unusable, bboSeen } = await spoolDay({
+    day, markets, bySlug, throttle, eventsDir,
+    feed: feed.map((rel) => ({ path: rel, bytes: 0, rows: () => readRows(root, rel) })),
+  });
+
+  return {
+    // THE SAME ORDER THE QUEUE FEEDS — see sortMarketsForReplay. A local replay
+    // that emitted its logs in a different order than the queue would break the
+    // one promise `ot run` makes: the identical files from the identical
+    // archive.
+    markets: sortMarketsForReplay(out),
+    // Every file this day was actually read from, the same field the queue
+    // records — coverage states which days really read the top-of-book stream,
+    // and it has to answer that the same way on both sides.
+    inputs: feed,
+    bboKeys: [...bboSeen].filter(Boolean).sort(),
+    unusable,
+    reason: out.length === 0 && unusable.length
+      ? `${unusable.length} market(s) unusable: ${unusable[0].why}`
+      : null,
+  };
+}
+
+/** Days a local archive appears to hold, sorted. */
+export async function localDays(root) {
+  const all = await walk(root);
+  const days = new Set();
+  for (const rel of all) {
+    const d = dayOfPath(rel);
+    if (d) days.add(d);
+  }
+  return [...days].sort();
+}
+
+/** The venues a local archive holds data files for. */
+export async function archiveVenues(root) {
+  const venues = new Set();
+  for (const rel of await walk(root)) {
+    const meta = classifyPath(rel);
+    if (meta.dataset !== 'other') venues.add(meta.venue);
+  }
+  return venues;
+}
+
+/**
+ * The venue `ot run` replays when `--venue` is not given.
+ *
+ * The public samples are one venue per archive, and a polymarket read of the
+ * predict one sees no files at all — so the documented
+ * `ot run . --data ./predict-fun-data-samples` failed with "no files for <day>"
+ * and nothing pointed at the missing flag. Only an archive that holds predict
+ * and nothing else changes the default; everything else keeps polymarket.
+ */
+export function defaultVenue(venues) {
+  return venues.size === 1 && venues.has('predict') ? 'predict' : 'polymarket';
+}
+
+/** Does this look like a cloned sample archive at all? */
+export async function looksLikeArchive(root) {
+  try {
+    const s = await stat(root);
+    if (!s.isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  const all = await walk(root);
+  return all.some((rel) => classifyPath(rel).dataset !== 'other');
+}
