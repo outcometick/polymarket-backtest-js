@@ -18,7 +18,9 @@ TWAP or a 60-second TWAP. The market's own config states which (`cryptoMarketCon
 0 → instantaneous, 30, 60). The venue moved markets between these over time, so the date is never used to decide.
 A Predict.fun market settles on its own price feed, matched by `price_feed_id`.
 
-**A market is dropped, and listed in the report's coverage, when** it has no asset; its settlement stream cannot be
+**A market is dropped, and listed in the report's coverage, when** it has no asset; it is a Polymarket market whose
+`token_ids` is not two distinct ids (every book, best-bid/ask and trade row is assigned to Up or Down through that
+pair, so without it the market would replay against an empty book); its settlement stream cannot be
 resolved; its outcome cannot be read (Polymarket: a complete `["1","0"]` / `["0","1"]` pair from a resolved
 market; Predict.fun: an `end_price` exists); it has no events inside its window; or its window has no settlement
 ticks. A dropped market is visible and costs nothing; a market settled on a guess would be invisible and wrong.
