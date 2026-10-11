@@ -179,7 +179,10 @@ baselines are price measures and are computed before fees.
 
 | block | what it holds |
 | --- | --- |
-| `metrics` | net PnL, win rate, profit factor, max drawdown (on realised PnL), Sharpe (daily realised PnL, ×√365), peak capital at risk, return on it, holding ratio, edge per contract, Brier score, fees, average hold |
+| `metrics` | net PnL, win rate, profit factor, max drawdown (on realised PnL), Sharpe and Sortino (daily realised PnL, ×√365; Sortino against the downside, target 0), net PnL over max drawdown, trading days / winning days / best and worst day, peak capital at risk, return on it, holding ratio, edge per contract (share-weighted) and edge per trade (each settled trade counts once — the two can have opposite signs), Brier score, fees, average hold |
+| `by_settlement` | the same results per settlement rule (the stream each market settles on: instantaneous, 30 s or 60 s TWAP), with every market counted, entered or not — markets on different rules are reported side by side, never only blended |
+| `activity` | contracts and dollars that changed hands, taker and maker, from the fill log |
+| `fingerprint` | the pre-registration fingerprint (below) |
 | `calibration` | by entry-price bucket: price paid against the rate at which that side actually won |
 | `baselines` | always UP, always DOWN, always the favourite — bought at the opening quote (the first moment both sides are quoted), at the strategy's average size, held to settlement |
 | `slippage` | fills at the quote, fills that walked the book, unfilled orders, slippage percentiles, PnL lost to slippage |
@@ -187,7 +190,34 @@ baselines are price measures and are computed before fees.
 | `coverage` | market-days scanned, every dropped market-day with its reason, which settlement stream each market used, which days the best-bid/ask refinement applied to |
 | `equity` | realised PnL, one point per closed trade (thinned to 2,000 points, keeping every extreme) |
 
-Full trade and fill rows are in `Result.trades` / `Result.fills` (and in the hosted run's archive).
+Full trade and fill rows are in `Result.trades` / `Result.fills` (and in the hosted run's archive). `Result.markets`
+(`markets.csv` in an archive) has one row per market replayed **including every market the strategy never
+entered** — market id, asset, length, settlement rule, open and close, strike, outcome, opening quotes, whether it
+was entered, trades, contracts, PnL, fees, first entry and both edges — which is what a market-level confidence
+interval or a permutation test on outcomes needs.
+
+**Pre-registration.** `report.fingerprint.sha256` is one hash over every file of the strategy directory byte for
+byte (code, a config file it reads, its series and `outcometick.json` itself — `code_sha256`; reformatting the
+manifest is a different fingerprint, because the strategy could read the difference), the manifest's defaults
+spelled out, the params, the execution options, the bytes of every declared series, the scope (venue, assets, and every day run, in order — dropping one day from the middle
+is a different fingerprint), your own data's bytes (generic data: the markets file and every frame file,
+`data_sha256`), the local replay settings (`book_throttle`, `mark_max_age_ms`), the fee policy actually applied,
+the implementation (engine image tag and decoder version — an upgrade that changes results changes the
+fingerprint) and the seed. Compute it before
+running — `ot fingerprint <dir> --assets … --from … --to …` (or `--data <your-dataset>`), or
+`outcometick.backtest.fingerprint(path, assets=…, days=[…])` — and publish it; the report of the run you then make
+carries the same value, from the hosted queue, `ot run` or the Python runner alike. A strategy passed as an
+in-process Python class has no code files, so its fingerprint covers everything except the code (`code_sha256` is
+null). The archive files a run actually read are reported next to it as `inputs_sha256` (sorted
+`path:sha256` lines, hashed): it cannot be part of the pre-registered value, because which files a day needs is
+known only once its markets are read, but it shows exactly which bytes produced the report — the hosted catalog's
+checksums and a local archive's files give the same value for the same files.
+
+`run()` and `run_template()` execute the strategy inside your Python process: the files are hashed and loaded
+from one snapshot, bytecode caches and earlier strategy modules are set aside, and a directory that changes
+during the run is refused — but process-wide state (a library the strategy monkeypatches, globals left by
+earlier code) is shared and not covered by the fingerprint. For a fully isolated, reproducible run use `ot run`
+(a fresh process per run) or the hosted backtester (a container).
 
 ## 8. Limits that apply everywhere
 

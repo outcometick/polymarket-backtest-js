@@ -64,7 +64,8 @@ logs, checksums — to a zip you can open in a notebook. When it looks right:
 
 ```bash
 export OT_BACKTEST_KEY=bt_...          # from outcometick.com/backtest
-ot submit my-strategy --assets btc,eth --days 30
+ot fingerprint my-strategy --assets btc,eth --from <day> --to <day>   # pre-register: publish this first
+ot submit my-strategy --assets btc,eth --from <day> --to <day>
 ot status run_...                      # then: ot fetch run_...
 ```
 

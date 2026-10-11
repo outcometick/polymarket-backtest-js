@@ -62,7 +62,8 @@ export default class Favourite extends Strategy {
 
 ```bash
 export OT_BACKTEST_KEY=bt_...          # 在 outcometick.com/zh/backtest 获取
-ot submit my-strategy --assets btc,eth --days 30
+ot fingerprint my-strategy --assets btc,eth --from <day> --to <day>   # 预注册：先公布这个值
+ot submit my-strategy --assets btc,eth --from <day> --to <day>
 ot status run_...                      # 完成后：ot fetch run_...
 ```
 
