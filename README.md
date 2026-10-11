@@ -1,7 +1,7 @@
 <!-- Generated from the outcometick monorepo by scripts/publish-backtest-repo.mjs. Edits here are overwritten; open an issue or a PR and it is ported back. -->
 # outcometick backtest · JavaScript / TypeScript
 
-**Tick-level backtesting for Polymarket and Predict.fun crypto Up/Down markets, in JavaScript.** Write a
+**Tick-level backtesting for Polymarket and Predict.fun crypto Up/Down markets — and, from your own data, any Polymarket binary market — in JavaScript.** Write a
 strategy class, replay it locally with the `ot` command line against the archived order book, and submit the
 same files to the [hosted backtester](https://outcometick.com/backtest) when you want the full range. Every
 market settles at $1 / $0 on the Chainlink stream it actually settled on, and every taker fill pays the venue's
@@ -121,6 +121,28 @@ favourite at the opening quote. If a strategy cannot beat buying the favourite, 
 unthrottled best-bid/ask stream can only remove levels the market has moved past, never add one. Every
 market-day that could not be replayed is listed with the reason.
 
+## Your own data: any Polymarket binary market
+
+The archive holds crypto Up/Down markets. For anything else — elections, sports, any market with two outcomes —
+point `ot run` at a directory of your own data: `markets.json` (or `.jsonl`) at its top, Polymarket CLOB
+market-channel frames in `*.jsonl` / `*.jsonl.gz` under it.
+
+```bash
+ot run ./my-strategy --data ./my-polymarket-data
+```
+
+- **Markets** are Gamma market objects as the API returns them, or `{market_id, token_ids, labels, ...}`.
+- **Frames** are Polymarket's own: `book`, `price_change`, `best_bid_ask`, `last_trade_price`,
+  `market_resolved` — raw, or as rows with the frame under `payload`. Every identifier a frame carries must
+  agree with one market.
+- **Orders can name an outcome** (`side: "Yes"`, `"Lakers"`); a label the market does not have stops the run.
+- **Settlement only from evidence** (Gamma's resolution, a `market_resolved` frame, or your own
+  `resolution: {outcome, resolved_ts_ms}`, all agreeing). Trading ends the millisecond before the outcome is
+  public and the payout lands then. Unresolved markets are valued at the external mid when trading ends
+  (`--mark-max-age-ms` refuses an old quote; no mark values a position at 0), reported apart from realised PnL.
+- A book row that cannot be read drops the whole market, listed in the report with the reason. The Python
+  package also reads the single-book table shape (`Dataset.from_pmdata`).
+
 ## Also in the package
 
 - **`outcometick/data`** — the data-subscription client (list, download with checksum verification) and
@@ -135,7 +157,8 @@ market-day that could not be replayed is listed with the reason.
   in the feed), book deltas are thinned to a capture cadence, and your orders have no market impact. They run
   on Polymarket only: the Predict.fun archive has no trade stream to advance a queue, so `gtc` is refused there.
   The independent auditor does not yet re-derive resting-order fills.
-- 5-minute and 15-minute crypto Up/Down markets, the ones the archive holds.
+- From the archive: 5-minute and 15-minute crypto Up/Down markets. Any other Polymarket binary market runs
+  from your own data ([above](#your-own-data-any-polymarket-binary-market)); the hosted backtester runs archive data only.
 - The Binance reference feed lives on the hosted runner, so strategies that read it are submitted, not run
   locally.
 - One sample day says nothing about next month. Backtest over a range before trusting any number.

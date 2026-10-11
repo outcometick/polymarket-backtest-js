@@ -1,7 +1,7 @@
 <!-- Generated from the outcometick monorepo by scripts/publish-backtest-repo.mjs. Edits here are overwritten; open an issue or a PR and it is ported back. -->
 # outcometick 回测 · JavaScript / TypeScript
 
-**用 JavaScript 对 Polymarket 与 Predict.fun 加密货币涨跌市场做逐笔回测。** 写一个策略类，用 `ot` 命令行在本地按归档的真实盘口重放；
+**用 JavaScript 对 Polymarket 与 Predict.fun 加密货币涨跌市场做逐笔回测；自带数据时，任意 Polymarket 二元市场都能回测。** 写一个策略类，用 `ot` 命令行在本地按归档的真实盘口重放；
 想跑完整区间时，把同一份文件提交到[托管回测](https://outcometick.com/zh/backtest)。每个市场都按它实际使用的 Chainlink 结算流
 以 1 美元 / 0 美元结算，每一笔吃单成交都扣平台的吃单手续费。做市策略可以挂限价单：排队模型按 Polymarket 实际的撮合记录方式建立，
 报告给出成交后的价格走势，看这些成交值不值。
@@ -102,6 +102,24 @@ session 模式下，时间上重叠的市场按同一条时间线交错重放，
 **对数据坦白。** 盘口由按固定节奏采集的快照和增量重建；不抽稀的最优买卖价流只能删掉已被越过的档位，不能凭空添加。
 每个没能重放的市场日都会列出原因。
 
+## 用你自己的数据：任意 Polymarket 二元市场
+
+归档里只有加密货币涨跌市场。其他市场（选举、体育、任何两个结果的市场）可以让 `ot run` 指向你自己的数据目录：
+顶层放 `markets.json`（或 `.jsonl`），下面放 `*.jsonl` / `*.jsonl.gz` 的 Polymarket CLOB 行情帧。
+
+```bash
+ot run ./my-strategy --data ./my-polymarket-data
+```
+
+- **市场**用 Gamma API 返回的市场对象，或 `{market_id, token_ids, labels, ...}`。
+- **行情帧**就是 Polymarket 自己的：`book`、`price_change`、`best_bid_ask`、`last_trade_price`、`market_resolved`，
+  原样或放在 `payload` 下。帧里带的每个标识都必须指向同一个市场。
+- **下单可以写结果名**（`side: "Yes"`、`"Lakers"`）；写了市场没有的标签，回测直接停止。
+- **只凭证据结算**（Gamma 的结算结果、`market_resolved` 帧，或你提供的 `resolution: {outcome, resolved_ts_ms}`，
+  且全部一致）。结果公开的前一毫秒停止交易，兑付记在那个时刻。未结算的市场在交易结束时按外部中间价估值
+  （`--mark-max-age-ms` 拒绝过旧的报价；没有估值的仓位按 0 计），与已实现盈亏分开报告。
+- 读不出的盘口行会让整个市场不参与回放，报告里列出原因。Python 包另外能读单盘口表格形态（`Dataset.from_pmdata`）。
+
 ## 包里还有
 
 - **`outcometick/data`**：数据订阅客户端（列文件、下载并校验 sha256），以及 `OrderBook`，用归档的 `book`、`price_change`、
@@ -113,7 +131,7 @@ session 模式下，时间上重叠的市场按同一条时间线交错重放，
 
 - 挂单：排队位置是从聚合档位估算的（数据里没有单个挂单），盘口增量按采集频率抽稀，你的订单不产生市场冲击。挂单只支持 Polymarket：
   Predict.fun 的归档没有成交流，无法推进排队，所以那里拒绝 `gtc`。独立核对器目前还不重算挂单成交。
-- 只有 5 分钟和 15 分钟的加密货币涨跌市场，也就是归档里有的那些。
+- 归档里只有 5 分钟和 15 分钟的加密货币涨跌市场。其他 Polymarket 二元市场用你自己的数据回测（见上文）；托管回测只跑归档数据。
 - 币安参考价流在托管机器上，读它的策略只能提交，不能在本地跑。
 - 一个样本日说明不了下个月。相信任何数字之前，先在一段时间范围上回测。
 

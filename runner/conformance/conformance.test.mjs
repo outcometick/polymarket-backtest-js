@@ -213,6 +213,120 @@ function makerEvents() {
 }
 
 /**
+ * A generic-data market's stream (runner/generic-data.mjs): one book whose
+ * DOWN token is the mirror — snapshots carry both, deltas carry `mirror` and
+ * move both legs in one step — prints on both tokens, and a bound stamped the
+ * same millisecond as the level it removes (generic data prunes it; input
+ * order is real there). Events carry `seq` like decoded generic events.
+ */
+function genericEvents() {
+  const ev = [];
+  let seq = 0;
+  const push = (e) => { ev.push({ ...e, seq, recv_ts_ms: null }); seq += 1; };
+  let mid = 0.46;
+  for (let i = 0; i < 50; i += 1) {
+    const ts = 1000 + i * 700;
+    mid = Number((mid + (i % 7 === 0 ? 0.012 : (i % 3 === 0 ? -0.007 : 0.003))).toFixed(3));
+    const b1 = Number((mid - 0.01).toFixed(3));
+    const a1 = Number((mid + 0.01).toFixed(3));
+    if (i % 6 === 0) {
+      push({
+        kind: 'book', ts_ms: ts, snapshot: true,
+        levels: {
+          UP: { bids: [[b1, 120], [Number((b1 - 0.01).toFixed(3)), 300]], asks: [[a1, 110], [Number((a1 + 0.01).toFixed(3)), 260]] },
+          DOWN: {
+            bids: [[Number((1 - a1).toFixed(3)), 110], [Number((1 - a1 - 0.01).toFixed(3)), 260]],
+            asks: [[Number((1 - b1).toFixed(3)), 120], [Number((1 - b1 + 0.01).toFixed(3)), 300]],
+          },
+        },
+      });
+    } else {
+      push({ kind: 'book', ts_ms: ts, snapshot: false, side: 'UP', ladder: i % 2 ? 'bids' : 'asks', px: i % 2 ? b1 : a1, size: 40 + (i % 5) * 20, mirror: true });
+    }
+    if (i % 8 === 4) {
+      // A level and the bound that removes it, the same millisecond, in that order.
+      push({ kind: 'book', ts_ms: ts + 50, snapshot: false, side: 'UP', ladder: 'asks', px: Number((a1 - 0.005).toFixed(3)), size: 25, mirror: true });
+      push({ kind: 'book', ts_ms: ts + 50, snapshot: false, bbo: true, side: 'UP', bid: b1, ask: a1 });
+    }
+    push({ kind: 'tick', ts_ms: ts + 1, market_id: '0xconf', value: 65000 + i });
+    push({ kind: 'trade', ts_ms: ts + 150, market_id: '0xconf', side: 'UP', taker: 'SELL', px: b1, size: 30 + (i % 4) * 10 });
+    push({ kind: 'trade', ts_ms: ts + 300, market_id: '0xconf', side: 'DOWN', taker: 'BUY', px: Number((1 - b1).toFixed(3)), size: 25 + (i % 3) * 9 });
+    push({ kind: 'trade', ts_ms: ts + 450, market_id: '0xconf', side: 'UP', taker: 'BUY', px: a1, size: 20 + (i % 5) * 7 });
+  }
+  return ev;
+}
+
+const GENERIC = {
+  kind: 'generic', venue: 'polymarket', market_id: '0xconf', slug: 'conf', question: 'Conf?',
+  token_ids: ['t-yes', 't-no'], labels: ['Yes', 'No'], fee: { model: 'polymarket-taker-v1', rate: 0.07 },
+  tick_size: 0.001, min_size: 5, trading_end_ts_ms: null, asset: null, interval: null, strike: null,
+  open_ts_ms: 1000, close_ts_ms: 40_000, trade_until_ts_ms: 30_000, outcome: 'DOWN', resolved_ts_ms: 40_000,
+  resolution_source: 'gamma',
+};
+const GENERIC_MARKED = { ...GENERIC, outcome: null, resolved_ts_ms: null, resolution_source: null, close_ts_ms: 30_000 };
+
+const GENERIC_JS = `export class S {
+  onMarketOpen(ctx, m) { this.n = 0; this.labels = m.labels; ctx.log("open " + m.labels.join("/") + " " + m.close_ts_ms + " " + ("outcome" in m)); }
+  onTick(ctx, t) {
+    this.n += 1;
+    const b = ctx.book();
+    const bid = b.bestBid("UP"), ask = b.best("UP");
+    if (bid == null || ask == null) return null;
+    const r3 = (x) => Math.floor(x * 1000 + 0.5) / 1000;
+    if (this.n === 2) return { side: this.labels[0], size: 30, limit: 0.99 };
+    if (this.n === 4) return { side: "no", size: 12, limit: 0.99, hold_s: 3 };
+    if (this.n === 6) return { side: "Yes", size: 20, limit: r3(bid), tif: "gtc", client_id: "q1" };
+    if (this.n === 9) return { side: "YES", size: 10, limit: 0.01, reduce_only: true };
+    if (this.n === 14) return { side: "UP", size: 15, limit: r3(ask + 0.002), tif: "gtc", reduce_only: true };
+    if (this.n === 30 || this.n === 31) return [{ side: "Celtics", size: 3, limit: 0.99 }].filter(() => this.labels[1] === "Celtics")
+      .concat([{ side: this.labels[1], size: 8, limit: 0.99 }, { side: this.labels[0], size: 6, limit: 0.99 }]);
+    if (this.n === 41) return { side: "Yes", size: 5, limit: r3(bid - 0.004), tif: "gtc" };
+    return null;
+  }
+  onSettle(ctx, m, o) { ctx.log("settle " + o + " " + m.resolved_ts_ms); }
+}`;
+const GENERIC_PY = `import math
+
+
+def r3(x):
+    return math.floor(x * 1000 + 0.5) / 1000
+
+
+class S:
+    def on_market_open(self, ctx, market):
+        self.n = 0
+        self.labels = list(market.labels)
+        ctx.log("open " + "/".join(market.labels) + " " + str(market.close_ts_ms) + " " + ("true" if "outcome" in market else "false"))
+
+    def on_tick(self, ctx, tick):
+        self.n += 1
+        b = ctx.book()
+        bid = b.best_bid("UP")
+        ask = b.best("UP")
+        if bid is None or ask is None:
+            return None
+        if self.n == 2:
+            return {"side": self.labels[0], "size": 30, "limit": 0.99}
+        if self.n == 4:
+            return {"side": "no", "size": 12, "limit": 0.99, "hold_s": 3}
+        if self.n == 6:
+            return {"side": "Yes", "size": 20, "limit": r3(bid), "tif": "gtc", "client_id": "q1"}
+        if self.n == 9:
+            return {"side": "YES", "size": 10, "limit": 0.01, "reduce_only": True}
+        if self.n == 14:
+            return {"side": "UP", "size": 15, "limit": r3(ask + 0.002), "tif": "gtc", "reduce_only": True}
+        if self.n == 30 or self.n == 31:
+            out = [{"side": "Celtics", "size": 3, "limit": 0.99}] if self.labels[1] == "Celtics" else []
+            return out + [{"side": self.labels[1], "size": 8, "limit": 0.99}, {"side": self.labels[0], "size": 6, "limit": 0.99}]
+        if self.n == 41:
+            return {"side": "Yes", "size": 5, "limit": r3(bid - 0.004), "tif": "gtc"}
+        return None
+
+    def on_settle(self, ctx, market, outcome):
+        ctx.log("settle " + str(outcome) + " " + str(market.resolved_ts_ms))
+`;
+
+/**
  * Scenarios. Each is the same behaviour written once per language.
  *
  * They are chosen to hit the places the two engines could plausibly disagree:
@@ -841,7 +955,9 @@ async function run(lang, scenario, jobOverrides = {}) {
   };
   // Named rather than a chain of booleans: the third builder is where a
   // `a ? x : b ? y : z` starts silently picking the wrong fixture.
-  const BUILDERS = { oneSided: oneSidedEvents, bbo: bboEvents, nearClose: nearCloseEvents, maker: makerEvents };
+  const BUILDERS = {
+    oneSided: oneSidedEvents, bbo: bboEvents, nearClose: nearCloseEvents, maker: makerEvents, generic: genericEvents,
+  };
   const events = (BUILDERS[scenario.events] ?? scenarioEvents)();
 
   // A scenario may declare reference feeds; their rows are INTERLEAVED into
@@ -862,12 +978,14 @@ async function run(lang, scenario, jobOverrides = {}) {
     market: m.market, stream: m.stream,
     references: scenario.references ?? [],
     lags: scenario.lags ?? {},
+    ...(m.market.kind === 'generic' ? { terminal: scenario.terminals?.[m.market.market_id] ?? null } : {}),
   });
   // Both harnesses take the job on stdin, in the same framing the worker uses:
   // per market, or the merged session stream (runner/session-feed.mjs).
   const stdinLines = [JSON.stringify(job)];
   if (job.mode === 'session') {
-    for await (const line of sessionLines(marketList, { linesOf: async (m) => m.lines, headerOf })) {
+    const cursorOf = (m) => (async function* lines() { yield* m.lines; }());
+    for await (const line of sessionLines(marketList, { linesOf: async (m) => m.lines, headerOf, cursorOf })) {
       stdinLines.push(line);
     }
   } else {
@@ -1163,6 +1281,54 @@ class S:
 `,
 });
 
+// Generic data: labels as sides, mirrored deltas, same-ms bounds, trading
+// ending before settlement (resting orders expire, nothing executes after it),
+// payout at the resolution time, and the two ways an unresolved market closes.
+for (const [label, market, terminals, expect] of [
+  ['resolved after trading ends', GENERIC, {}, (trades) => {
+    assert.ok(trades.length > 0 && trades.every((t) => t.how !== 'marked'));
+    assert.ok(trades.some((t) => t.how === 'settled' && t.closed_ms === 40_000 && t.label));
+  }],
+  ['unresolved, marked', GENERIC_MARKED, { '0xconf': { UP: 0.47, DOWN: 0.53, source: 'up_mid', ts_ms: 29_000, age_ms: 1000 } }, (trades) => {
+    assert.ok(trades.some((t) => t.how === 'marked' && t.mark_px != null && t.closed_ms === 30_000));
+  }],
+  ['unresolved, no usable mark', GENERIC_MARKED, { '0xconf': { none: 'stale' } }, (trades) => {
+    assert.ok(trades.some((t) => t.how === 'marked' && t.mark_px == null && t.mark_missing === 'stale'));
+  }],
+]) {
+  SCENARIOS.push({
+    name: `generic data: ${label}`,
+    events: 'generic',
+    job: { fees: { mode: 'venue' }, fillDelayMs: 100, resting: { allowed: true, cancelLatencyMs: 40 } },
+    markets: [market],
+    terminals,
+    js: GENERIC_JS,
+    py: GENERIC_PY,
+    expect,
+    expectStats: (s) => assert.ok(s.expired >= 1, `nothing expired at trade_until: ${JSON.stringify(s)}`),
+  });
+}
+SCENARIOS.push({
+  name: 'generic data: session over two markets, end and close at their own times',
+  events: 'generic',
+  job: { mode: 'session', fees: { mode: 'venue' }, fillDelayMs: 100, resting: { allowed: true, cancelLatencyMs: 40 } },
+  markets: [
+    { ...GENERIC, market_id: '0xg1', token_ids: ['a1', 'a2'], trade_until_ts_ms: 20_000, close_ts_ms: 33_000, resolved_ts_ms: 33_000 },
+    { ...GENERIC_MARKED, market_id: '0xg2', token_ids: ['b1', 'b2'], open_ts_ms: 1000 },
+  ],
+  terminals: { '0xg2': { UP: 0.41, DOWN: 0.59, source: 'down_mid', ts_ms: 29_500, age_ms: 500 } },
+  marketEvents: {
+    '0xg1': genericEvents().map((e) => ({ ...e, market_id: e.market_id ? '0xg1' : undefined, seq: e.seq * 2 })).filter((e) => e.ts_ms <= 20_000),
+    '0xg2': genericEvents().map((e) => ({ ...e, market_id: e.market_id ? '0xg2' : undefined, seq: e.seq * 2 + 1 })),
+  },
+  js: GENERIC_JS.replace('if (this.n === 2) return { side: this.labels[0]', 'if (this.n === 2) return { side: this.labels[0]'),
+  py: GENERIC_PY,
+  expect: (trades) => {
+    assert.ok(trades.some((t) => t.market_id === '0xg1' && t.how === 'settled' && t.closed_ms === 33_000));
+    assert.ok(trades.some((t) => t.market_id === '0xg2' && t.how === 'marked' && t.label));
+  },
+});
+
 for (const scenario of SCENARIOS) {
   test(`both engines agree: ${scenario.name}`, async () => {
     // A scenario may carry its own params; without this the new cases would
@@ -1191,7 +1357,11 @@ for (const scenario of SCENARIOS) {
       assert.equal(a.side, b.side, `${where}: side`);
       assert.equal(a.how, b.how, `${where}: how`);
       assert.equal(a.outcome ?? null, b.outcome ?? null, `${where}: outcome`);
-      for (const f of ['size', 'entry_px', 'exit_px', 'pnl', 'fees', 'opened_ms', 'closed_ms']) {
+      assert.equal(a.label, b.label, `${where}: label`);
+      assert.equal(a.mark_source ?? null, b.mark_source ?? null, `${where}: mark_source`);
+      assert.equal(a.mark_missing ?? null, b.mark_missing ?? null, `${where}: mark_missing`);
+      for (const f of ['size', 'entry_px', 'exit_px', 'pnl', 'fees', 'opened_ms', 'closed_ms',
+        'mark_px', 'marked_size', 'marked_pnl', 'mark_ts_ms', 'mark_age_ms']) {
         closeEnough(a[f], b[f], f, where);
       }
     }
@@ -1205,6 +1375,7 @@ for (const scenario of SCENARIOS) {
       assert.equal(a.levels_walked, b.levels_walked, `${where}: levels_walked`);
       assert.equal(a.liquidity, b.liquidity, `${where}: liquidity`);
       assert.equal(a.order_id, b.order_id, `${where}: order_id`);
+      assert.equal(a.label, b.label, `${where}: label`);
       for (const f of ['ts_ms', 'requested', 'filled', 'unfilled', 'avg_px', 'worst_px', 'quoted_px', 'fee', 'realised',
         'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
         'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle']) {

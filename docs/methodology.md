@@ -194,3 +194,39 @@ Full trade and fill rows are in `Result.trades` / `Result.fills` (and in the hos
 - The per-event budget the hosted sandbox enforces (a sustained mean of 400 µs per hook call) applies locally too,
   so a strategy that would be refused there is refused here.
 - One day is a sample, not evidence. Backtest across a range, and compare against the baselines.
+
+## 9. Your own data (any Polymarket binary market)
+
+The same engine, fills, fees and report, on data you bring: a markets file (Gamma market objects, or
+`{market_id, token_ids, labels, ...}`) and Polymarket CLOB market-channel frames. What differs from the archive,
+and why:
+
+- **Order within a millisecond is the input's.** Events sort by time, then by input position (file, line,
+  position in a `price_changes` batch). The archive sorts a millisecond by kind because its files are read in an
+  arbitrary order; a recorded stream is not. For the same reason a best-bid/ask bound removes a level set in the
+  same millisecond before it.
+- **Strict parsing.** A book, delta or bound row that cannot be read — a price outside [0, 1], a side other than
+  BUY/SELL, two levels at one price, a token the market does not own, identifiers naming two markets — drops the
+  whole market, listed with the reason and the input position. A bad trade row is dropped and counted.
+- **A window that opens mid-stream** starts from the book as it stood: every earlier book row is folded into one
+  snapshot at the window's start.
+- **Resolution only from evidence**: Gamma's `umaResolutionStatus: resolved` with `outcomePrices` exactly
+  1/0, 0/1 or 0.5/0.5 (Polymarket's 50:50), a `market_resolved` frame, or a `resolution` you supply. Sources
+  must agree, or the market is dropped; a resolution without a time is dropped too, because it cannot say when
+  trading had to stop. The time used is the frame's when there is one (observed), else yours, else Gamma's.
+- **Lifecycle.** Trading ends at the first of: your declared trading end, the millisecond before the outcome
+  became public, the last event. Events after it are dropped before the replay; orders still in flight expire;
+  resting orders expire. A resolved market pays at its resolution time (in session mode, cash arrives then).
+- **Valuation.** An unresolved market's open positions are valued when trading ends at a mark computed from the
+  market data only — the UP token's mid, else 1 − the DOWN token's mid, else the last public print — each
+  candidate checked against `mark_max_age_ms` before the next is tried. A hedged pair is worth exactly $1.
+  Cash does not move: the report's `valuation` block separates `realised_pnl` from `marked_pnl`, lists every
+  position valued at 0 for want of a mark, and states the oldest mark used. These rows are not scored for
+  Brier, edge or calibration (only held-to-settlement rows are), and the baselines use resolved markets only,
+  with the strategy's own result on those markets (`strategy_on_resolved`) beside them.
+- **The single-book table shape** (Python, `Dataset.from_pmdata`) carries one book; the other outcome is its
+  mirror, and each update moves both in one step. Trades come from the trades table only, so each public print
+  is counted once.
+- **Known simplification**: on any mirrored book (this one, and Predict.fun's), an immediate order on each of the
+  two outcomes consumes its own copy of the depth, so the same source liquidity can be taken twice. Resting
+  orders already share one queue and one print budget.

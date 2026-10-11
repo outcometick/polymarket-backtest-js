@@ -33,6 +33,20 @@ that Python's `os.scandir` returns files in filesystem order where Node's `readd
 `Number("0x10")`, `(0.125).toFixed(2)`, `Math.round(0.49999999999999994)`, number-to-string past 1e21 — against
 JavaScript itself.
 
+
+## Your own data
+
+`verify/generic-equivalence.test.mjs` does the same for data you bring (any Polymarket binary market): a
+synthetic dataset holding every frame form, each resolution source, unresolved markets valued three ways, one
+market refused per strictness rule, a window opening mid-stream, same-millisecond sequences across markets, a
+gzipped file, CRLF line ends and junk lines. Both decoders must produce the same markets, refusals, row counts
+and events; then the same strategies — orders by outcome label, resting quotes, session mode — run through the
+command line in JavaScript and in Python and through the Python library, and every trade, fill, report field and
+log line must match. The conformance suite adds generic markets to the engine-against-engine comparison:
+mirrored deltas, a bound in the same millisecond as the level it removes, trading ending before settlement,
+valued and unvalued positions. And on the real public sample, an archive day written back out as generic data
+(frames in the archive's own order) replays to the same fills, and to the same trades except the settlement
+millisecond.
 ## Answers worked by hand
 
 `tests/test_backtest.py` (Python repository) builds a one-market archive and checks the result against arithmetic
