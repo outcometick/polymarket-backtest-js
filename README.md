@@ -60,7 +60,8 @@ export default class Favourite extends Strategy {
 ```
 
 `ot run` prints the headline numbers and writes the whole result — report JSON, every trade and fill as CSV,
-logs, checksums — to a zip you can open in a notebook. When it looks right:
+logs, checksums — to a zip you can open in a notebook. Decoded days are cached (`--cache off` to skip it), so
+running the sample day again takes about 11 s instead of 53 s, with the same result byte for byte. When it looks right:
 
 ```bash
 export OT_BACKTEST_KEY=bt_...          # from outcometick.com/backtest
