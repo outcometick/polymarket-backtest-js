@@ -120,6 +120,14 @@ ot run ./my-strategy --data ./my-polymarket-data
   （`--mark-max-age-ms` 拒绝过旧的报价；没有估值的仓位按 0 计），与已实现盈亏分开报告。
 - 读不出的盘口行会让整个市场不参与回放，报告里列出原因。Python 包另外能读单盘口表格形态（`Dataset.from_pmdata`）。
 
+## 执行选项
+
+默认全部关闭，在 `outcometick.json` 里设置（托管和 `ot run` 一样）：`"fok": true` 允许全成或全撤的订单；
+`"order_rules": "assumed"`（归档：价格网格 0.001、最少 5 股、数量以 0.01 股为单位）或 `"venue"`（你自己的数据）；
+`"maker_rebate": 0.2`（挂单返佣的估算）；`"quote_guard": {"max_age_ms": 1500, "ask_sum": [0.92, 1.08]}`；单盘口市场用
+`"mirror_depth": "shared"`。本地可以用 `ot run --book-throttle off` 不做抽稀地回放归档盘口。每一项做什么、做不到什么，
+见 [Methodology §10](docs/methodology.md#10-execution-options)。
+
 ## 包里还有
 
 - **`outcometick/data`**：数据订阅客户端（列文件、下载并校验 sha256），以及 `OrderBook`，用归档的 `book`、`price_change`、

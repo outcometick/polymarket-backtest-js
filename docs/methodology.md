@@ -230,3 +230,62 @@ and why:
 - **Known simplification**: on any mirrored book (this one, and Predict.fun's), an immediate order on each of the
   two outcomes consumes its own copy of the depth, so the same source liquidity can be taken twice. Resting
   orders already share one queue and one print budget.
+
+## 10. Execution options
+
+All off by default — a run that sets none of them replays exactly as before. Same keys in the manifest, in
+`run(...)` / `run_template(...)`, hosted and local; both engines implement each one and the conformance suite
+compares them trade by trade.
+
+- **`fok: true`** enables `tif: "fok"`: the whole size must be available within the limit when the order reaches
+  the book (measured before anything is taken), or nothing fills. A refused order is a fill row with
+  `reject_reason: "fok_unfilled"`. Declared up front so every output knows its columns before the first row.
+- **`order_rules`** holds orders to the venue's rules: the size is at least the minimum and on the 0.01-share grid,
+  the limit is on the tick grid, and a notional converts to hundredths of a share (an SDK `Order` built with
+  a notional converts to whole shares when it is built — still on the grid; a plain order object's notional is
+  converted by the runner). An exit is clamped to the
+  position and floored to the grid before it is checked, so a dust position below the minimum is held to
+  settlement, as it would be on the venue. `"venue"` reads each market's own tick and minimum (your own data);
+  `"assumed"` is for the archive, whose markets do not carry them: tick 0.001 and minimum 5 shares, the values
+  measured on the archive. The report says it is an assumption — a market quoting in 0.01 would accept a 0.001
+  limit here, one quoting finer would refuse it. Refusals are counted by reason (`below_min_size`, `size_step`,
+  `off_tick`).
+- **`maker_rebate`** (a fraction, e.g. 0.2) credits each resting fill with that share of the taker fee the same
+  fill would have cost, as a negative fee. An estimate: the venue pays maker rebates from a daily pool, pro rata,
+  and the report says so.
+- **`quote_guard`** — `{max_age_ms, ask_sum: [lo, hi]}` — lets an opening taker order execute only when both
+  outcomes have a best ask and their sum is in range, and all four best quotes were set within `max_age_ms`
+  (a missing quote fails). A resting order that fails it is refused whole, so it cannot rest and fill later.
+  Exits are not blocked unless the guard sets `include_exits: true` — a guard that blocks an exit holds the
+  position to settlement. Ages are exchange-time ages of the level (`ctx.book().quote_ts(side)`).
+- **`mirror_depth: "shared"`** is for single-book markets (Predict.fun, and data read with `from_pmdata`): an
+  outcome's ask at p and the other's bid at 1 − p are one liquidity, so taking one removes the other.
+- **Local only:** `book_throttle=False` (`ot run --book-throttle off`) replays the archive's book stream without
+  the per-asset thinning the hosted runs apply. Passing it either way writes `coverage.book_throttle`, the window
+  actually used per asset or `"off"`. The archive's stream was already rate-limited when it was captured, so
+  "off" is the densest the archive has, not every update the venue sent.
+
+The report's `orders` block lists the options used, what they refused and the rebate total.
+
+## 11. Timers and feed latency (one time line)
+
+Declaring the `on_timer` hook or a `feed_latency` puts the run on a single time line across every market in
+it. Each market's pending work — orders and cancels reaching the venue, timers, lagged events reaching the
+strategy — is a job at a time; before anything at time T is processed, every job strictly earlier runs, in
+every market, earliest first (at one millisecond: exchange jobs, then arrivals, then timers; then the market's
+position in the run; then the order they were made). Jobs due exactly at T run after everything the data says
+happened at T. So a strategy shared across overlapping markets never sees its clock go back, and a timer at
+150 never sees a reference row stamped 151.
+
+- **Timers.** `ctx.schedule(at_ms, tag)` wakes `on_timer(ctx, timer)` at that time, with `ctx.now = at_ms`; it may
+  return orders like any hook. `at_ms` must be after now and not after the market's declared close; a market
+  opens at its own open time, so `on_market_open` can schedule from there. Limits per market: 64 pending,
+  10,000 set, 100,000 fired. Timers still pending when trading ends are dropped and counted
+  (`report.timers`).
+- **A ctx kept from another market** (session mode) acts at the run's time, not that market's last event:
+  a timer it sets must be after the run's current time, and a cancel it sends happens from then on.
+- **Feed latency.** With `feed_latency: L`, every event reaches the strategy L ms after it happened: hooks fire
+  then, and `ctx.book()`, `ctx.history()` and the position's mark show the market as the strategy has heard
+  of it. Orders, resting-order queues and the quote guard always use the venue's own book at the moment they
+  act. Fills are known to `ctx.position()` when they happen — there is no separate order-response latency.
+- Without either, runs take the per-market path they always took, byte for byte.

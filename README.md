@@ -143,6 +143,15 @@ ot run ./my-strategy --data ./my-polymarket-data
 - A book row that cannot be read drops the whole market, listed in the report with the reason. The Python
   package also reads the single-book table shape (`Dataset.from_pmdata`).
 
+## Execution options
+
+Off by default; set them in `outcometick.json` (hosted and `ot run` alike): `"fok": true` for fill-or-kill orders,
+`"order_rules": "assumed"` (archive: tick 0.001, minimum 5 shares, sizes in 0.01) or `"venue"` (your own data),
+`"maker_rebate": 0.2` (an estimate of the venue's rebate on resting fills), `"quote_guard": {"max_age_ms": 1500,
+"ask_sum": [0.92, 1.08]}`, and `"mirror_depth": "shared"` for single-book markets. Locally,
+`ot run --book-throttle off` replays the archive's book without the per-asset thinning. What each one does, and
+what it cannot know, is in [Methodology §10](docs/methodology.md#10-execution-options).
+
 ## Also in the package
 
 - **`outcometick/data`** — the data-subscription client (list, download with checksum verification) and

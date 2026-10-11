@@ -932,6 +932,7 @@ async function run(lang, scenario, jobOverrides = {}) {
     on_book: ['onBook', 'on_book'],
     on_trade: ['onTrade', 'on_trade'],
     on_settle: ['onSettle', 'on_settle'],
+    on_timer: ['onTimer', 'on_timer'],
   };
   // A template declares exactly its manifest's hooks (the market-making one has
   // no on_tick); the inline cases all have on_market_open and on_tick.
@@ -985,7 +986,8 @@ async function run(lang, scenario, jobOverrides = {}) {
   const stdinLines = [JSON.stringify(job)];
   if (job.mode === 'session') {
     const cursorOf = (m) => (async function* lines() { yield* m.lines; }());
-    for await (const line of sessionLines(marketList, { linesOf: async (m) => m.lines, headerOf, cursorOf })) {
+    const timed = job.engine?.scheduler === 'global';
+    for await (const line of sessionLines(marketList, { linesOf: async (m) => m.lines, headerOf, cursorOf, timed })) {
       stdinLines.push(line);
     }
   } else {
@@ -1329,6 +1331,204 @@ SCENARIOS.push({
   },
 });
 
+// Execution options (phase 2a). Each scenario turns one on through job.engine,
+// exactly as the worker, `ot run` and the Python library send it.
+const EXEC_JS = `export class S {
+  onMarketOpen(ctx, m) { this.n = 0; }
+  onTick(ctx, t) {
+    this.n += 1;
+    const n = this.n;
+    if (n === 2) return { side: "UP", size: 15, limit: 0.99, tif: "fok" };
+    if (n === 3) return { side: "UP", size: 100000, limit: 0.99, tif: "fok" };
+    if (n === 4) return { side: "DOWN", size: 4, limit: 0.99 };
+    if (n === 5) return { side: "DOWN", size: 5.005, limit: 0.99 };
+    if (n === 6) return { side: "DOWN", size: 6, limit: 0.9905 };
+    if (n === 7) return { side: "DOWN", notional: 7, limit: 0.97 };
+    if (n === 9) return { side: "UP", size: 1000, reduce_only: true };
+    if (n === 11) return { side: "DOWN", size: 12, limit: 0.99, tif: "fok" };
+    return null;
+  }
+}`;
+const EXEC_PY = `class S:
+    def on_market_open(self, ctx, market):
+        self.n = 0
+
+    def on_tick(self, ctx, tick):
+        self.n += 1
+        n = self.n
+        if n == 2:
+            return {"side": "UP", "size": 15, "limit": 0.99, "tif": "fok"}
+        if n == 3:
+            return {"side": "UP", "size": 100000, "limit": 0.99, "tif": "fok"}
+        if n == 4:
+            return {"side": "DOWN", "size": 4, "limit": 0.99}
+        if n == 5:
+            return {"side": "DOWN", "size": 5.005, "limit": 0.99}
+        if n == 6:
+            return {"side": "DOWN", "size": 6, "limit": 0.9905}
+        if n == 7:
+            return {"side": "DOWN", "notional": 7, "limit": 0.97}
+        if n == 9:
+            return {"side": "UP", "size": 1000, "reduce_only": True}
+        if n == 11:
+            return {"side": "DOWN", "size": 12, "limit": 0.99, "tif": "fok"}
+        return None
+`;
+const ASSUMED_RULES = { mode: 'assumed', tick: 0.001, min_size: 5, size_step: 0.01 };
+for (const [label, engine, expectOrders] of [
+  ['fok and the assumed order rules', { fok: true, order_rules: ASSUMED_RULES }, (o) => {
+    for (const k of ['fok_unfilled', 'below_min_size', 'size_step', 'off_tick']) assert.ok(o.rejected[k] >= 1, `${k} never refused`);
+  }],
+  ['quote guard on the ask sum and on quote age', { fok: true, quote_guard: { ask_sum: [0.95, 1.0], max_age_ms: 600 } }, (o) => {
+    assert.ok(o.rejected.quote_guard >= 1, 'the guard never refused');
+  }],
+  ['shared mirrored depth', { fok: true, mirror_depth: 'shared', mirror_markets: 'all' }, null],
+]) {
+  SCENARIOS.push({
+    name: `execution options: ${label}`,
+    events: 'maker',
+    job: { feeBps: 0, fillDelayMs: 0, engine },
+    markets: [{ ...MARKET, close_ts_ms: 44_000 }],
+    js: EXEC_JS,
+    py: EXEC_PY,
+    expectOrders,
+  });
+}
+SCENARIOS.push({
+  name: 'execution options: maker rebate on resting fills',
+  events: 'maker',
+  job: { fees: { mode: 'venue' }, fillDelayMs: 150, resting: { allowed: true, cancelLatencyMs: 50 }, engine: { maker_rebate: 0.2 } },
+  markets: [{ ...MARKET, close_ts_ms: 44_000, fee: { model: 'polymarket-taker-v1', rate: 0.07 } }],
+  js: MAKER_JS,
+  py: MAKER_PY,
+  expectFills: (fills) => {
+    const maker = fills.filter((f) => f.liquidity === 'maker');
+    assert.ok(maker.length && maker.every((f) => f.rebate > 0 && f.fee < 0), 'every maker fill earned a rebate');
+  },
+  expectOrders: (o) => assert.ok(o.rebates > 0),
+});
+
+// Phase 2b: the global scheduler. Timers and a feed latency, in market mode
+// and across overlapping markets in session mode. Every hook logs ctx.now, so
+// the logs ARE the time line: both engines must write the same lines, and the
+// times they print must never go backwards.
+const TIMER_JS = `export class S {
+  seen(ctx) { if (this.last != null && ctx.now < this.last) ctx.log("TIMEBACK " + this.last + " " + ctx.now); this.last = ctx.now; }
+  onMarketOpen(ctx, m) {
+    this.seen(ctx);
+    this.k = (this.k ?? 0) + 1;
+    ctx.log("open " + m.market_id + " " + ctx.now);
+    ctx.schedule(ctx.now + 1500, "a" + this.k);
+    ctx.schedule(ctx.now + 4200, "b" + this.k);
+    this.drop = ctx.schedule(ctx.now + 2500);
+  }
+  onTick(ctx, t) {
+    this.seen(ctx);
+    ctx.log("tick " + ctx.now + " lag " + (ctx.now - t.ts_ms));
+    if (this.drop) { ctx.log("unschedule " + ctx.unschedule(this.drop)); this.drop = null; }
+    return null;
+  }
+  onTimer(ctx, t) {
+    this.seen(ctx);
+    const b = ctx.book();
+    ctx.log("timer " + t.id + " " + t.tag + " " + t.at_ms + " " + ctx.now + " " + b.best("UP"));
+    if (t.tag && t.tag[0] === "a") { ctx.schedule(ctx.now + 700, null); return { side: "UP", size: 5, limit: 0.99 }; }
+    if (t.tag === null) return { side: "UP", size: 5, reduce_only: true };
+    return null;
+  }
+}`;
+const TIMER_PY = `class S:
+    def seen(self, ctx):
+        last = getattr(self, "last", None)
+        if last is not None and ctx.now < last:
+            ctx.log("TIMEBACK " + str(last) + " " + str(ctx.now))
+        self.last = ctx.now
+
+    def on_market_open(self, ctx, market):
+        self.seen(ctx)
+        self.k = getattr(self, "k", 0) + 1
+        ctx.log("open " + market.market_id + " " + str(ctx.now))
+        ctx.schedule(ctx.now + 1500, "a" + str(self.k))
+        ctx.schedule(ctx.now + 4200, "b" + str(self.k))
+        self.drop = ctx.schedule(ctx.now + 2500)
+
+    def on_tick(self, ctx, tick):
+        self.seen(ctx)
+        ctx.log("tick " + str(ctx.now) + " lag " + str(ctx.now - tick.ts_ms))
+        if self.drop:
+            ctx.log("unschedule " + ("true" if ctx.unschedule(self.drop) else "false"))
+            self.drop = None
+        return None
+
+    def on_timer(self, ctx, t):
+        self.seen(ctx)
+        b = ctx.book()
+        best = b.best("UP")
+        ctx.log("timer " + t.id + " " + str(t.tag if t.tag is not None else "null") + " " + str(t.at_ms) + " "
+                + str(ctx.now) + " " + (str(best) if best is not None else "null"))
+        if t.tag and t.tag[0] == "a":
+            ctx.schedule(ctx.now + 700, None)
+            return {"side": "UP", "size": 5, "limit": 0.99}
+        if t.tag is None:
+            return {"side": "UP", "size": 5, "reduce_only": True}
+        return None
+`;
+const timeLine = (logs) => logs.split('\n').filter(Boolean)
+  .map((l) => { const m = /(?:open \S+|tick|timer \S+ \S+ \d+) (\d+)/.exec(l); return m ? Number(m[1]) : null; })
+  .filter((x) => x != null);
+for (const [label, engine, mode] of [
+  ['timers, market mode', { scheduler: 'global', timers: true, feed_latency: 0 }, 'market'],
+  ['timers and a 300ms feed latency', { scheduler: 'global', timers: true, feed_latency: 300 }, 'market'],
+]) {
+  SCENARIOS.push({
+    name: `global scheduler: ${label}`,
+    events: 'maker',
+    hooks: ['on_timer'],
+    job: { feeBps: 0, fillDelayMs: 50, engine, mode },
+    markets: [{ ...MARKET, open_ts_ms: 1000, close_ts_ms: 30_000 }],
+    js: TIMER_JS,
+    py: TIMER_PY,
+    expectLogs: (logs) => {
+      assert.match(logs, /timer t1 a1 2500 2500/);
+      assert.match(logs, /unschedule true/);
+      assert.doesNotMatch(logs, /timer t3 /, 'the unscheduled timer never fired');
+      const ts = timeLine(logs);
+      for (let i = 1; i < ts.length; i += 1) assert.ok(ts[i] >= ts[i - 1], `time went back: ${ts[i - 1]} -> ${ts[i]}`);
+      if (engine.feed_latency) assert.ok(/lag 300/.test(logs) && !/lag 0/.test(logs), 'every tick heard 300ms late');
+    },
+  });
+}
+
+{
+  const shift = (evs, d, id) => evs.map((e) => ({ ...e, ts_ms: e.ts_ms + d, ...(e.market_id ? { market_id: id } : {}) }));
+  for (const latency of [0, 250]) {
+    SCENARIOS.push({
+      name: `global scheduler: session, two overlapping markets, feed latency ${latency}`,
+      events: 'maker',
+      hooks: ['on_timer'],
+      job: { feeBps: 0, fillDelayMs: 50, mode: 'session', engine: { scheduler: 'global', timers: true, feed_latency: latency } },
+      markets: [
+        { ...MARKET, market_id: '0xA', open_ts_ms: 1000, close_ts_ms: 30_000 },
+        { ...MARKET, market_id: '0xB', outcome: 'DOWN', open_ts_ms: 3333, close_ts_ms: 36_000 },
+      ],
+      marketEvents: {
+        '0xA': makerEvents().filter((e) => e.ts_ms <= 30_000),
+        '0xB': shift(makerEvents(), 2333, '0xB').filter((e) => e.ts_ms <= 36_000),
+      },
+      js: TIMER_JS,
+      py: TIMER_PY,
+      expectLogs: (logs) => {
+        // One instance across both markets: the clock it sees never goes back
+        // (logs are written per market at its close, so the instance checks).
+        assert.ok(timeLine(logs).length > 40);
+        assert.doesNotMatch(logs, /TIMEBACK/);
+        assert.match(logs, /open 0xB 3333/);
+        assert.match(logs, /timer t\d+ a2 4833 4833/);
+      },
+    });
+  }
+}
+
 for (const scenario of SCENARIOS) {
   test(`both engines agree: ${scenario.name}`, async () => {
     // A scenario may carry its own params; without this the new cases would
@@ -1376,6 +1576,8 @@ for (const scenario of SCENARIOS) {
       assert.equal(a.liquidity, b.liquidity, `${where}: liquidity`);
       assert.equal(a.order_id, b.order_id, `${where}: order_id`);
       assert.equal(a.label, b.label, `${where}: label`);
+      assert.equal(a.reject_reason, b.reject_reason, `${where}: reject_reason`);
+      closeEnough(a.rebate, b.rebate, 'rebate', where);
       for (const f of ['ts_ms', 'requested', 'filled', 'unfilled', 'avg_px', 'worst_px', 'quoted_px', 'fee', 'realised',
         'queue_ahead_at_join', 'queue_ahead_at_fill', 'time_in_queue_ms',
         'markout_1s', 'markout_10s', 'markout_60s', 'markout_settle']) {
@@ -1389,6 +1591,11 @@ for (const scenario of SCENARIOS) {
     }
 
     closeEnough(js.result.feesPaid, py.result.feesPaid, 'fees_paid', scenario.name);
+    assert.deepEqual(js.result.orders, py.result.orders, `${scenario.name}: order counters`);
+    if (scenario.expectOrders) {
+      scenario.expectOrders(js.result.orders);
+      scenario.expectOrders(py.result.orders);
+    }
     assert.equal(js.result.marketsRun, py.result.marketsRun);
     // Agreement alone would pass two engines that are wrong the same way.
     if (scenario.expect) {
@@ -1402,6 +1609,10 @@ for (const scenario of SCENARIOS) {
     if (scenario.expectFills) {
       scenario.expectFills(js.fills);
       scenario.expectFills(py.fills);
+    }
+    if (scenario.expectLogs) {
+      assert.equal(js.logs, py.logs, `${scenario.name}: logs differ between engines`);
+      scenario.expectLogs(js.logs);
     }
   });
 }
@@ -1536,6 +1747,100 @@ test('both engines reject a declared-but-missing hook the same way', async () =>
   const [js, py] = await Promise.all([run('node', broken), run('python', broken)]);
   assert.equal(js.result.rejection.code, 'E_HOOK_SIG');
   assert.equal(py.result.rejection.code, 'E_HOOK_SIG');
+});
+
+test('global scheduler: a ctx kept from another market cannot schedule into the run\'s past', async () => {
+  // A opens at 1000 and its last event before B opens (3333) is at 3220, so
+  // ctxA.now is 3220 while the run is at 3333: a timer at 3332 is after
+  // ctxA.now and before the run. It must be refused, not fired back in time.
+  const shift = (evs, d, id) => evs.map((e) => ({ ...e, ts_ms: e.ts_ms + d, ...(e.market_id ? { market_id: id } : {}) }));
+  const scenario = (offset) => ({
+    name: `kept ctx ${offset}`,
+    events: 'maker',
+    hooks: ['on_timer'],
+    markets: [
+      { ...MARKET, market_id: '0xA', open_ts_ms: 1000, close_ts_ms: 30_000 },
+      { ...MARKET, market_id: '0xB', outcome: 'DOWN', open_ts_ms: 3333, close_ts_ms: 36_000 },
+    ],
+    marketEvents: {
+      '0xA': makerEvents().filter((e) => e.ts_ms <= 30_000),
+      '0xB': shift(makerEvents(), 2333, '0xB').filter((e) => e.ts_ms <= 36_000),
+    },
+    js: `export class S {
+  onMarketOpen(ctx, m) {
+    if (m.market_id === "0xA") { this.a = ctx; return; }
+    ctx.log("B open " + ctx.now + " A now " + this.a.now);
+    ctx.log("kept " + this.a.schedule(ctx.now + (${offset}), "kept"));
+  }
+  onTick() { return null; }
+  onTimer(ctx, t) { ctx.log("timer " + t.tag + " " + t.at_ms + " " + ctx.now + " " + ctx.position().size); }
+}`,
+    py: `class S:
+    def on_market_open(self, ctx, market):
+        if market.market_id == "0xA":
+            self.a = ctx
+            return
+        ctx.log("B open " + str(ctx.now) + " A now " + str(self.a.now))
+        ctx.log("kept " + self.a.schedule(ctx.now + (${offset}), "kept"))
+
+    def on_tick(self, ctx, tick):
+        return None
+
+    def on_timer(self, ctx, t):
+        ctx.log("timer " + t.tag + " " + str(t.at_ms) + " " + str(ctx.now) + " " + str(ctx.position().size))
+`,
+  });
+  const job = { feeBps: 0, fillDelayMs: 50, mode: 'session', engine: { scheduler: 'global', timers: true, feed_latency: 0 } };
+  const past = scenario(-1);
+  const [jp, pp] = await Promise.all([run('node', past, job), run('python', past, job)]);
+  for (const r of [jp, pp]) {
+    assert.equal(r.code, 10, r.stderr);
+    assert.equal(r.result.rejection.code, 'E_RUNTIME');
+    assert.match(r.result.rejection.detail, /after now \(3333\), got 3332/);
+  }
+  // Ahead of the run it is an ordinary timer of market A, fired at its time.
+  const ahead = scenario(100);
+  const [ja, pa] = await Promise.all([run('node', ahead, job), run('python', ahead, job)]);
+  for (const r of [ja, pa]) {
+    assert.equal(r.code, 0, r.stderr + JSON.stringify(r.result?.rejection ?? null));
+    assert.match(r.logs, /B open 3333 A now 3220/);
+    assert.match(r.logs, /timer kept 3433 3433 /);
+  }
+});
+
+test('global scheduler: Python asks a cancel through a kept ctx at the run clock too', async () => {
+  // The Python mirror of the replay.test.mjs case of the same name.
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const py = `
+import sys, json
+sys.path.insert(0, ${JSON.stringify(fileURLToPath(new URL('../harness/python', import.meta.url)))})
+from otreplay import MarketReplay
+T = 1000000
+class S:
+    sent = False
+    def on_market_open(self, ctx, market):
+        self.ctx = ctx
+    def on_book(self, ctx, ev):
+        if self.sent:
+            return None
+        self.sent = True
+        return {"side": "UP", "size": 5, "limit": 0.4, "tif": "gtc", "client_id": "x"}
+clock = {"t": float("-inf")}
+s = S()
+r = MarketReplay(market={"market_id": "m", "open_ts_ms": T, "close_ts_ms": T + 60000, "outcome": "UP"}, strategy=s,
+                 hooks={"on_market_open": "on_market_open", "on_book": "on_book"},
+                 resting={"allowed": True, "refusal": None, "cancelLatencyMs": 10},
+                 engine={"scheduler": "global", "timers": False, "feed_latency": 0}, clock=clock)
+r.open(T)
+r.step({"kind": "book", "ts_ms": T, "snapshot": True, "levels": {"UP": {"asks": [[0.6, 10]], "bids": [[0.39, 10]]}, "DOWN": {"asks": [[0.61, 10]], "bids": [[0.4, 10]]}}})
+clock["t"] = T
+r.run_one()
+clock["t"] = T + 5000
+print(json.dumps([r.maker.stats["rested"], s.ctx.now, s.ctx.cancel("x"), r.next_due()["at"]]))
+`;
+  const { stdout } = await promisify(execFile)(PYTHON, ['-c', py]);
+  assert.deepEqual(JSON.parse(stdout), [1, 1_000_000, true, 1_005_010]);
 });
 
 test('a strategy that throws is E_RUNTIME in both, naming the hook', async () => {
