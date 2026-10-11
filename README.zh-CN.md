@@ -128,6 +128,11 @@ ot run ./my-strategy --data ./my-polymarket-data
 `"mirror_depth": "shared"`。本地可以用 `ot run --book-throttle off` 不做抽稀地回放归档盘口。每一项做什么、做不到什么，
 见 [Methodology §10](docs/methodology.md#10-execution-options)。
 
+声明 `onTimer` hook（配合 `ctx.schedule(atMs, tag)`）或 `"feed_latency"` 后，同一次运行的所有市场走同一条时间线：定时器在指定时刻唤醒策略；
+设了行情延迟时，策略晚这么久才收到每个事件，而订单仍按平台盘口撮合（[§11](docs/methodology.md#11-timers-and-feed-latency-one-time-line)）。
+挂单可以用 `"queue_model": {"prob": "power", "n": 2}`（或 `power2`、`power3`、`log`、`log2`）估计没有成交能解释的档位减量中有多少发生在你前面，
+而不是假定一点都没有。这是估计，请与默认结果对比（[§12](docs/methodology.md#12-probabilistic-queue-models-optional)）。
+
 ## 包里还有
 
 - **`outcometick/data`**：数据订阅客户端（列文件、下载并校验 sha256），以及 `OrderBook`，用归档的 `book`、`price_change`、

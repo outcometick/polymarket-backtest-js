@@ -1216,6 +1216,20 @@ for (const [label, job] of [
   });
 }
 
+// Phase 2c: the probabilistic queue models on the same resting-order script,
+// every function, both engines row for row (and a session and generic case).
+for (const qp of [{ prob: 'power', n: 3 }, { prob: 'power2', n: 2 }, { prob: 'power3', n: 2 }, { prob: 'log', n: null }, { prob: 'log2', n: null }]) {
+  SCENARIOS.push({
+    name: `resting orders, queue model ${qp.prob}${qp.n ? ` n=${qp.n}` : ''}`,
+    events: 'maker',
+    job: { fees: { mode: 'venue' }, fillDelayMs: 150, resting: { allowed: true, cancelLatencyMs: 50 }, engine: { queue_prob: qp } },
+    markets: [{ ...MARKET, close_ts_ms: 44_000, fee: { model: 'polymarket-taker-v1', rate: 0.07 } }],
+    js: MAKER_JS,
+    py: MAKER_PY,
+    expectFills: (fills) => assert.ok(fills.some((f) => f.liquidity === 'maker'), 'no maker fill'),
+  });
+}
+
 // The lifecycle's rarer exits, each forced once: post_only refused on arrival,
 // a cancel that lands before the order does, a reduce-only order whose
 // position an IOC already closed, and expiry at the close.
@@ -1841,6 +1855,111 @@ print(json.dumps([r.maker.stats["rested"], s.ctx.now, s.ctx.cancel("x"), r.next_
 `;
   const { stdout } = await promisify(execFile)(PYTHON, ['-c', py]);
   assert.deepEqual(JSON.parse(stdout), [1, 1_000_000, true, 1_005_010]);
+});
+
+test('the queue model scenarios do take the probabilistic path', async () => {
+  // Agreement alone would pass two engines that both ignored queue_prob.
+  const base = SCENARIOS.find((x) => x.name === 'resting orders (venue fee, zero latency)');
+  const prob = SCENARIOS.find((x) => x.name === 'resting orders, queue model power n=3');
+  const plain = await run('node', base, { ...prob.job, engine: undefined });
+  const moved = await run('node', prob, prob.job);
+  const key = (r) => JSON.stringify(r.fills.filter((f) => f.liquidity === 'maker').map((f) => [f.ts_ms, f.filled, f.queue_ahead_at_fill]));
+  assert.notEqual(key(moved), key(plain));
+});
+
+test('Python reaches the hand-computed queue-model answers of maker-prob.test.mjs', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const py = `
+import sys, json
+sys.path.insert(0, ${JSON.stringify(fileURLToPath(new URL('../harness/python', import.meta.url)))})
+from otengine import Book, Portfolio
+from otmaker import MakerBook
+T0 = 1000
+def setup(prob, size=100, limit=0.40, activate=True):
+    pf = Portfolio(fees={"mode": "bps", "bps": 0})
+    mk = MakerBook("m", pf, queue_prob=prob)
+    bk = Book("m")
+    bk.snapshot(T0, {"UP": {"bids": [[0.40, size]], "asks": [[0.60, 100]]}, "DOWN": {"bids": [[0.40, 100]], "asks": [[0.60, size]]}})
+    rec = mk.submit({"side": "UP", "size": 10, "limit": limit, "tif": "gtc"}, T0)
+    if activate:
+        mk.activate(rec, T0, bk)
+    return pf, mk, bk, rec
+def bid(s, ts, size):
+    pf, mk, bk, rec = s
+    mk.finalize(ts)
+    mk.book_event({"kind": "book", "ts_ms": ts, "side": "UP", "ladder": "bids", "px": 0.40, "size": size}, bk,
+                  lambda: bk.delta(ts, "UP", "bids", 0.40, size))
+def prt(s, ts, size, px=0.40):
+    pf, mk, bk, rec = s
+    mk.finalize(ts)
+    mk.trade({"kind": "trade", "ts_ms": ts, "side": "UP", "taker": "SELL", "px": px, "size": size}, bk)
+P = lambda prob, n=None: {"prob": prob, "n": n}
+out = {}
+r = []
+for prob in (P("power", 2), P("power2", 2), P("power3", 2), None):
+    s = setup(prob); bid(s, 1500, 200); bid(s, 2000, 160); r.append(s[3].ahead)
+out["middle"] = r
+r = []
+for prob in (P("power", 2), None):
+    s = setup(prob); bid(s, 1500, 200); prt(s, 2000, 30); bid(s, 2100, 170); prt(s, 2200, 20); r.append(s[3].ahead)
+out["print_first"] = r
+s = setup(P("power", 2)); bid(s, 1500, 200); bid(s, 2000, 170); a = s[3].ahead; prt(s, 2100, 30); b = s[3].ahead; prt(s, 2200, 20)
+out["book_first"] = [a, b, s[3].ahead]
+s = setup(P("log"), size=50); prt(s, 2000, 30); prt(s, 2100, 30)
+out["double"] = [e[2] for e in s[1].unseen["bids"]]
+r = []
+for t in (2800, 2801):
+    s = setup(P("power", 1)); bid(s, 1500, 200); prt(s, 2000, 30); bid(s, t, 170); r.append(s[3].ahead)
+out["expiry"] = r
+s = setup(P("power", 1), size=200, activate=False); prt(s, 1100, 30); s[1].activate(s[3], 1200, s[2]); bid(s, 1250, 300); bid(s, 1300, 270)
+out["inactive"] = s[3].ahead
+s = setup(P("power", 2), size=50, limit=0.39); prt(s, 2000, 40, 0.39); prt(s, 2100, 40, 0.39)
+out["reach"] = len([f for f in s[0].fills if f.get("liquidity") == "maker"])
+print(json.dumps(out))
+`;
+  const { stdout } = await promisify(execFile)(PYTHON, ['-c', py]);
+  const got = JSON.parse(stdout);
+  const close = (a, b) => a.every((x, i) => Math.abs(x - b[i]) < 1e-9);
+  assert.ok(close(got.middle, [80, 70, 90, 100]), JSON.stringify(got.middle));
+  assert.ok(close(got.print_first, [50, 70]), JSON.stringify(got.print_first));
+  assert.ok(close(got.book_first, [85, 85, 65]), JSON.stringify(got.book_first));
+  assert.deepEqual(got.double, [30, 20]);
+  assert.ok(close(got.expiry, [70, 59.5]), JSON.stringify(got.expiry));
+  assert.ok(Math.abs(got.inactive - 200) < 1e-9);
+  assert.equal(got.reach, 1);
+});
+
+test('queueProb and ln1p: the same bits in both engines', async () => {
+  const { queueProb, ln1p } = await import('../engine/maker.mjs');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const xs = [0, 1e-12, 2 ** -21, 2 ** -20, 0.01, 0.3, 1, 3, 100, 12345.678, 1e6, 999999999.5, 1e15];
+  const models = [];
+  for (const prob of ['power', 'power2', 'power3']) for (let n = 1; n <= 10; n += 1) models.push({ prob, n });
+  models.push({ prob: 'log', n: null }, { prob: 'log2', n: null });
+  const hex = (v) => (v == null ? null : (() => { const d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, v); return d.getBigUint64(0).toString(16); })());
+  const js = { ln: xs.map((x) => hex(ln1p(x))), p: [] };
+  for (const m of models) for (const a of xs) for (const b of xs) js.p.push(hex(queueProb(m, a, b)));
+  const py = `
+import sys, json, struct
+sys.path.insert(0, ${JSON.stringify(fileURLToPath(new URL('../harness/python', import.meta.url)))})
+from otmaker import queue_prob, ln1p
+xs = json.loads(sys.argv[1]); models = json.loads(sys.argv[2])
+hx = lambda v: None if v is None else format(struct.unpack(">Q", struct.pack(">d", float(v)))[0], "x")
+out = {"ln": [hx(ln1p(x)) for x in xs], "p": []}
+for m in models:
+    for a in xs:
+        for b in xs:
+            out["p"].append(hx(queue_prob(m, a, b)))
+print(json.dumps(out))
+`;
+  const { stdout } = await promisify(execFile)(PYTHON, ['-c', py, JSON.stringify(xs), JSON.stringify(models)], { maxBuffer: 1 << 24 });
+  const got = JSON.parse(stdout);
+  assert.deepEqual(got.ln, js.ln);
+  assert.equal(got.p.length, js.p.length);
+  for (let i = 0; i < js.p.length; i += 1) assert.equal(got.p[i], js.p[i], `queueProb #${i}`);
+  assert.ok(js.p.filter((v) => v != null).length > 2000, 'the grid mostly lands inside the contract');
 });
 
 test('a strategy that throws is E_RUNTIME in both, naming the hook', async () => {

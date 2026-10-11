@@ -152,6 +152,14 @@ Off by default; set them in `outcometick.json` (hosted and `ot run` alike): `"fo
 `ot run --book-throttle off` replays the archive's book without the per-asset thinning. What each one does, and
 what it cannot know, is in [Methodology §10](docs/methodology.md#10-execution-options).
 
+Declaring an `onTimer` hook (with `ctx.schedule(atMs, tag)`) or a `"feed_latency"` puts every market of the run on
+one time line: timers wake the strategy at chosen times, and with a feed latency the strategy hears of each event
+that much later while orders still match the venue's book
+([§11](docs/methodology.md#11-timers-and-feed-latency-one-time-line)). For resting orders,
+`"queue_model": {"prob": "power", "n": 2}` (or `power2`, `power3`, `log`, `log2`) estimates how much of an
+unexplained size drop left from in front of your order instead of assuming none did — an estimate, so compare it
+with the default ([§12](docs/methodology.md#12-probabilistic-queue-models-optional)).
+
 ## Also in the package
 
 - **`outcometick/data`** — the data-subscription client (list, download with checksum verification) and

@@ -289,3 +289,34 @@ happened at T. So a strategy shared across overlapping markets never sees its cl
   of it. Orders, resting-order queues and the quote guard always use the venue's own book at the moment they
   act. Fills are known to `ctx.position()` when they happen — there is no separate order-response latency.
 - Without either, runs take the per-market path they always took, byte for byte.
+
+## 12. Probabilistic queue models (optional)
+
+Rule 4 of section 3 assumes the worst about a level that shrinks with no trade to explain it: everything that
+left was behind your order. `queue_model` replaces that with an estimate of how much left from in front, in the
+shape hftbacktest popularised: with `a` in front of the order and `b` behind it, the share from behind is
+
+| `prob` | share from behind |
+|---|---|
+| `power` (`n` 1–10) | `b^n / (b^n + a^n)` |
+| `power2` (`n` 1–10) | `(b / (a + b))^n` |
+| `power3` (`n` 1–10) | `1 − (a / (a + b))^n` |
+| `log` | `ln(1+b) / (ln(1+b) + ln(1+a))` |
+| `log2` | `ln(1+b) / ln(1+a+b)` |
+
+and an unexplained drop `c` moves the order to `a − (1 − p)·c + min(0, b − p·c)`, never past the visible size.
+
+What counts as *unexplained* is decided on the archive alone, where your orders do not exist. A print removes
+volume from the levels it reaches (consuming first any book drop it explains, the depletion ledger); what it
+removed and the book has not shown yet waits, per price, for the next drop there, which absorbs it once. Only the
+remainder of a drop is ledgered and handed to the model. A bbo bound only caps the queue (a pruned crossed level
+says nothing about where in it volume left). Each order keeps its own history on top: the waterfall of section 3
+advances it, the entry window still applies, so an order's queue can lag what the archive level knows — that only
+ever errs against it.
+
+Limits, stated plainly: both waiting lists live `print_lag_ms` (800 ms), a heuristic window — a book drop arriving
+after the print's entry expired is read as a cancellation; a print masked by a same-size refill within one book
+update waits until it expires. The model's shares are an assumption the archive cannot check. The default stays
+the conservative queue; run both and compare. The report names the model (`maker.queue_model`
+`polymarket-queue-v1+prob-v1`, `maker.queue_prob`). The functions use only `+ − × ÷` in a fixed order (no library
+`pow` or `log`), so both engines produce the same bits, and the conformance suite checks them bit for bit.
