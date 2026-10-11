@@ -1027,9 +1027,10 @@ async function run(lang, scenario, jobOverrides = {}) {
   const trades = pick(CHANNEL.trade).map((p) => parseTrade(JSON.parse(p))).filter(Boolean);
   const fills = pick(CHANNEL.fill).map((p) => parseFill(JSON.parse(p))).filter(Boolean);
   const logs = pick(CHANNEL.log).join('\n');
+  const records = pick(CHANNEL.record).map((p) => JSON.parse(p));
 
   await rm(dir, { recursive: true, force: true });
-  return { code, stderr, result, trades, fills, logs };
+  return { code, stderr, result, trades, fills, logs, records };
 }
 
 /**
@@ -1543,6 +1544,88 @@ for (const [label, engine, mode] of [
   }
 }
 
+// Phase 3b: the recorder on the resting-order script (archive), with timers on
+// (global scheduler), and on generic data — both engines, row for row.
+for (const [label, engine, events, markets, js, py] of [
+  ['resting orders', { record_ms: 1000 }, 'maker', [{ ...MARKET, close_ts_ms: 44_000, fee: { model: 'polymarket-taker-v1', rate: 0.07 } }], MAKER_JS, MAKER_PY],
+  ['timers and a feed latency', { record_ms: 1500, scheduler: 'global', timers: true, feed_latency: 300 }, 'maker', [{ ...MARKET, open_ts_ms: 1000, close_ts_ms: 30_000 }], TIMER_JS, TIMER_PY],
+]) {
+  SCENARIOS.push({
+    name: `recorder: ${label}`,
+    events,
+    hooks: engine.timers ? ['on_timer'] : [],
+    job: { fees: { mode: 'venue' }, fillDelayMs: 150, resting: { allowed: true, cancelLatencyMs: 50 }, engine, mode: 'market' },
+    markets,
+    js,
+    py,
+    expectRecords: (rows, result) => {
+      assert.ok(rows.length > 5, 'samples were written');
+      assert.equal(rows.filter((r) => r.final).length, 1, 'one FINAL per instance');
+      assert.ok(rows.some((r) => r.position_value > 0), 'a position was valued');
+      for (let i = 1; i < rows.length; i += 1) assert.ok(rows[i].ts >= rows[i - 1].ts);
+      assert.equal(result.record?.rows, rows.length);
+    },
+  });
+}
+
+SCENARIOS.push({
+  name: 'recorder: generic data, marked and settled markets',
+  events: 'generic',
+  job: { fees: { mode: 'venue' }, fillDelayMs: 100, resting: { allowed: true, cancelLatencyMs: 40 }, engine: { record_ms: 2000 } },
+  markets: [GENERIC_MARKED],
+  terminals: { '0xconf': { UP: 0.41, DOWN: 0.59, source: 'down_mid', ts_ms: 29_500, age_ms: 500 } },
+  js: GENERIC_JS,
+  py: GENERIC_PY,
+  expectRecords: (rows) => {
+    assert.ok(rows.length > 3);
+    assert.equal(rows.filter((r) => r.final).length, 1);
+  },
+});
+
+test('Python spends the record budget where samples are made, as JavaScript does', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const py = `
+import sys, json
+sys.path.insert(0, ${JSON.stringify(fileURLToPath(new URL('../harness/python', import.meta.url)))})
+from otengine import Portfolio
+from otreplay import MarketReplay
+T0 = 1000000
+class S:
+    sent = False
+    def on_book(self, ctx, ev):
+        if self.sent:
+            return None
+        self.sent = True
+        return {"side": "UP", "size": 10, "limit": 0.5}
+def book(ts, bid):
+    return {"kind": "book", "ts_ms": ts, "snapshot": True, "levels": {"UP": {"bids": [[bid, 100]], "asks": [[0.5, 100]]}, "DOWN": {"bids": [[0.48, 100]], "asks": [[0.58, 100]]}}}
+budget = {"rows": 0, "limit": 50, "truncated": False}
+r = MarketReplay(market={"market_id": "m", "open_ts_ms": T0, "close_ts_ms": T0 + 365 * 86400000, "outcome": "UP"},
+                 strategy=S(), hooks={"on_book": "on_book"}, portfolio=Portfolio(fees={"mode": "bps", "bps": 0}),
+                 engine={"record_ms": 1000}, record_budget=budget)
+r.open()
+r.step(book(T0, 0.40))
+r.step(book(T0 + 200 * 86400000, 0.45))
+out = r.close()
+print(json.dumps([len(out["record"]), budget["rows"], budget["truncated"], any(x["final"] for x in out["record"])]))
+`;
+  const { stdout } = await promisify(execFile)(PYTHON, ['-c', py]);
+  assert.deepEqual(JSON.parse(stdout), [50, 50, true, false]);
+});
+
+test('recording changes no trade, fill or fee in either engine', async () => {
+  const base = SCENARIOS.find((x) => x.name === 'recorder: resting orders');
+  for (const lang of ['node', 'python']) {
+    const on = await run(lang, base, base.job);
+    const off = await run(lang, base, { ...base.job, engine: undefined });
+    assert.ok(on.records.length > 0 && off.records.length === 0, lang);
+    assert.deepEqual(on.trades, off.trades, `${lang} trades`);
+    assert.deepEqual(on.fills, off.fills, `${lang} fills`);
+    assert.equal(on.result.feesPaid, off.result.feesPaid, `${lang} fees`);
+  }
+});
+
 for (const scenario of SCENARIOS) {
   test(`both engines agree: ${scenario.name}`, async () => {
     // A scenario may carry its own params; without this the new cases would
@@ -1560,6 +1643,9 @@ for (const scenario of SCENARIOS) {
 
     assert.equal(js.trades.length, py.trades.length,
       `trade count differs: node ${js.trades.length}, python ${py.trades.length}`);
+    // Recorder samples (record_ms): the same rows, value for value — and none at all when off.
+    assert.deepEqual(py.records, js.records, `${scenario.name}: record rows differ`);
+    if (scenario.expectRecords) scenario.expectRecords(js.records, js.result);
     assert.equal(js.fills.length, py.fills.length,
       `fill count differs: node ${js.fills.length}, python ${py.fills.length}`);
 

@@ -350,3 +350,22 @@ update waits until it expires. The model's shares are an assumption the archive 
 the conservative queue; run both and compare. The report names the model (`maker.queue_model`
 `polymarket-queue-v1+prob-v1`, `maker.queue_prob`). The functions use only `+ − × ÷` in a fixed order (no library
 `pow` or `log`), so both engines produce the same bits, and the conformance suite checks them bit for bit.
+
+## 13. The recorder (mark-to-market on a time grid)
+
+`record_ms: N` (market mode, 1000–3,600,000) writes each market's value every N milliseconds of UTC time: the cash
+the market has cost or paid so far, plus every open leg at its token's best bid (depth ignored; a leg with no bid
+counts 0 — what selling now would fetch, never a mid or a cost). One rule makes each point exact: before any change
+at time t — an order or cancel reaching the venue, an event, a timer, a terminal mark, the settlement — every grid
+point before t is written, so a point is the state after everything at or before it and nothing later; after the
+settlement, one final sample. Recording reads the ledger and the book only and changes no fill (tested off/on in
+both engines).
+
+The report's `record` block sums every market on the grid (a market counts 0 before its first point and its final
+value after it): points, final value, the maximum drawdown of that account value (peak starting at 0) and when,
+the worst point, the largest and the mean open-position value. It sees what the realised-PnL drawdown in `metrics`
+cannot — a loss an open position carried before it closed. `record.csv` has the account series and
+`record_markets.csv` every market's samples (`Result.record` / `record_markets` in Python). A run that would
+write more than 1,000,000 rows or 256 MiB of samples stops recording and reports `truncated` with no series — never
+a partial curve; the hosted backtester refuses such a scope at submit and names the smallest `record_ms` that fits.
+

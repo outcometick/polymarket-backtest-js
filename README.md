@@ -159,7 +159,9 @@ that much later while orders still match the venue's book
 ([§11](docs/methodology.md#11-timers-and-feed-latency-one-time-line)). For resting orders,
 `"queue_model": {"prob": "power", "n": 2}` (or `power2`, `power3`, `log`, `log2`) estimates how much of an
 unexplained size drop left from in front of your order instead of assuming none did — an estimate, so compare it
-with the default ([§12](docs/methodology.md#12-probabilistic-queue-models-optional)).
+with the default ([§12](docs/methodology.md#12-probabilistic-queue-models-optional)). `"record_ms": 60000` adds
+the account's value on a time grid (open legs at the best bid) and its drawdown — `record.csv` in the archive
+([§13](docs/methodology.md#13-the-recorder-mark-to-market-on-a-time-grid)).
 
 ## Also in the package
 
