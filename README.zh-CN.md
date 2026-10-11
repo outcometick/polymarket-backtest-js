@@ -126,6 +126,13 @@ session 模式下，时间上重叠的市场按同一条时间线交错重放，
   什么都不用下载；按扫描的市场日计费，没有产出报告的运行不收费。
 - **结算审计。** [逐个市场](https://outcometick.com/zh/polymarket-settlement-audit)用归档的 Chainlink 流重算结算结果，并和平台的结果对比。
 
+## 社区
+
+有问题、想讨论策略或对一对回测结果，欢迎来：
+
+- Discord（中英文分区）：https://discord.gg/ZDMqkptwm5
+- Telegram 群：https://t.me/+TcK_hJOzOz5mZTk1
+
 ## 仓库结构
 
 npm 包 `outcometick` 的源码和测试（`npm install && npm test`）：`ot` 命令行（`cli/`）、引擎和 harness（`runner/`）、共用的归档解码和契约

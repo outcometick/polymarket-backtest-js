@@ -153,6 +153,13 @@ market-day that could not be replayed is listed with the reason.
   recomputed from the archived Chainlink stream and compared with the venue's.
 - 中文站：[outcometick.com/zh](https://outcometick.com/zh)
 
+## Community
+
+Questions, strategy ideas, or a backtest result to compare notes on:
+
+- Discord (English and 中文): https://discord.gg/ZDMqkptwm5
+- Telegram: https://t.me/+TcK_hJOzOz5mZTk1
+
 ## This repository
 
 The `outcometick` npm package as source, with its tests (`npm install && npm test`): the `ot` CLI (`cli/`), the
