@@ -369,3 +369,41 @@ cannot — a loss an open position carried before it closed. `record.csv` has th
 write more than 1,000,000 rows or 256 MiB of samples stops recording and reports `truncated` with no series — never
 a partial curve; the hosted backtester refuses such a scope at submit and names the smallest `record_ms` that fits.
 
+## 14. Spot and the locked part of the settlement TWAP (optional)
+
+Polymarket's 5- and 15-minute crypto markets settle on Chainlink's 60-second TWAP at the close
+(`raw.cryptoMarketConfig.twapLookbackSeconds`). In the last minute part of that average is already fixed, and a
+strategy may want to know how much and at what level.
+
+**The `spot` dataset.** Declaring it feeds each market the 1 Hz Chainlink report stream of its asset (the archive's
+`prices` tree) inside the market's window, whatever stream the market settles on. It is quiet: it wakes no hook, is
+not a tick, never enters `ctx.history()` or the rolling helpers, and is not counted as an event seen. Within a
+millisecond a spot value is applied before the book, trades and ticks, so a hook on that millisecond reads it (a
+tie-break, not a recorded order). Under a feed latency it reaches the strategy late like every other event.
+Polymarket only; outside its capture window a run is refused. The report's `spot` block counts the markets that got
+any spot value and those that got none.
+
+Both read only values stamped at or before `ctx.now`, like `ctx.ref()`: a ctx kept from another market in session
+mode answers for its own clock, not a mix of later values and an earlier time.
+
+**`ctx.spot()`** returns the latest spot value that has reached the strategy, `{value, ts_ms}`, or null.
+
+**`ctx.twap_locked()`** reads the window `[close - lookback, close)` (lookback from the market's settlement stream:
+60 s for `twap60s`, 30 s for `twap30s`; null for a market that does not settle on a TWAP, before the window opens, or
+before any spot value in it has arrived):
+
+- `value`: the mean of the window's spot samples seen so far, one per feed timestamp (the first to arrive), no
+  interpolation over gaps;
+- `samples`; `elapsed_ms` since the window opened (capped at the lookback); `elapsed_fraction` = elapsed_ms / lookback
+  — time elapsed, not certainty;
+- `coverage` = samples / elapsed whole seconds, capped at 1 — the archive misses some seconds;
+- `last_ts_ms`: feed time of the latest spot value seen;
+- `projected` = elapsed_fraction × value + (1 − elapsed_fraction) × latest spot: the final average *if the price
+  stayed where it is*. Not a forecast. null when coverage is below 0.8 or the latest spot value is more than 5 s old.
+
+**It is an approximation.** Chainlink averages finer observations than this per-second stream. On one BTC day we
+measured (6,675 complete windows), recomputing the official twap60s from the archived spot stream over
+`[t - 60 s, t)` matched exactly never; the error was $0.51 at the median, $3.45 at the 99th percentile and $6.35 at
+worst. Settlement in the backtest never uses this: markets settle on their official outcome (§4). Event times are the
+feed's own (`feed_ts_ms`), as for every tick; set `feed_latency` to model when you would have heard of a value.
+

@@ -30,6 +30,8 @@ const NODE_HARNESS = path.join(HERE, '..', 'harness', 'node', 'harness.mjs');
 const PY_HARNESS = path.join(HERE, '..', 'harness', 'python', 'harness.py');
 const PYTHON = process.env.OT_PYTHON || 'python3';
 
+// The event builders by name, for tests outside run() (assigned below, after they are defined).
+const BUILDERS_FOR_TESTS = {};
 const MARKET = {
   market_id: '0xconf', asset: 'BTCUSD', interval: '1h',
   strike: 65000, outcome: 'UP', close_ts_ms: 100_000,
@@ -333,6 +335,7 @@ class S:
  * price quantisation, walking the book, partial fills, reduce_only clamping,
  * settlement, hold expiry, and multiple orders in one event.
  */
+Object.assign(BUILDERS_FOR_TESTS, { maker: makerEvents });
 const SCENARIOS = [
   {
     // Polymarket publishes ONE SIDE PER ROW, and its ask ladder descending.
@@ -972,7 +975,7 @@ async function run(lang, scenario, jobOverrides = {}) {
   // how the session cases build markets that overlap in time.
   const marketList = (scenario.markets ?? [MARKET]).map((m) => ({
     market: m,
-    stream: 'prices',
+    stream: scenario.stream ?? 'prices',
     lines: withRefs(scenario.marketEvents?.[m.market_id] ?? events).map((e) => JSON.stringify(e)),
   }));
   const headerOf = (m) => ({
@@ -1544,6 +1547,199 @@ for (const [label, engine, mode] of [
   }
 }
 
+// The spot dataset and ctx.twap_locked(), against hand-computed values. Close
+// 100 000, so the 60 s window opens at 40 000. Spot = 100 + 2 per second from
+// 40 000, nothing from 45 000 to 54 000, a second value at 60 000 that must not
+// enter the mean, and a value exactly at the close: spot() sees it, the window
+// [close - 60 s, close) does not.
+{
+  const spotEvents = () => {
+    const evs = [book(1000, { asks: [[0.50, 60]], bids: [[0.48, 100]] })];
+    for (let t = 35_000; t <= 100_000; t += 1000) {
+      if (t >= 45_000 && t <= 54_000) continue;
+      evs.push({ kind: 'spot', ts_ms: t, market_id: '0xconf', value: 100 + 2 * ((t - 40_000) / 1000), server_ts_ms: t + 900, recv_ts_ms: t + 1100 });
+      if (t === 60_000) evs.push({ kind: 'spot', ts_ms: t, market_id: '0xconf', value: 999, server_ts_ms: t + 950, recv_ts_ms: t + 1150 });
+    }
+    for (const t of [39_000, 44_500, 56_500, 100_000]) evs.push({ kind: 'tick', ts_ms: t, market_id: '0xconf', value: 65000 });
+    const rank = (e) => ({ spot: -1, book: 0, tick: 2 }[e.kind]);
+    return evs.sort((a, b) => (a.ts_ms - b.ts_ms) || (rank(a) - rank(b)));
+  };
+  const SPOT_JS = `export class S {
+    onMarketOpen(ctx, m) {}
+    onTick(ctx, t) {
+      const f = (x) => (x == null ? "null" : x.toFixed(6));
+      const s = ctx.spot();
+      const l = ctx.twap_locked();
+      ctx.log("lock " + ctx.now + " " + (s ? f(s.value) + "@" + s.ts_ms : "null") + " "
+        + (l ? [f(l.value), l.samples, l.elapsed_ms, f(l.elapsed_fraction), f(l.coverage), l.last_ts_ms, f(l.projected)].join(" ") : "null"));
+      return null;
+    }
+  }`;
+  const SPOT_PY = `class S:
+    def on_market_open(self, ctx, market):
+        pass
+
+    def on_tick(self, ctx, tick):
+        f = lambda x: "null" if x is None else f"{x:.6f}"
+        s = ctx.spot()
+        l = ctx.twap_locked()
+        ctx.log("lock " + str(ctx.now) + " " + (f(s.value) + "@" + str(s.ts_ms) if s else "null") + " "
+                + (" ".join([f(l.value), str(l.samples), str(l.elapsed_ms), f(l.elapsed_fraction), f(l.coverage),
+                             str(l.last_ts_ms), f(l.projected)]) if l else "null"))
+        return None
+`;
+  for (const latency of [0, 300]) {
+    SCENARIOS.push({
+      name: `spot and twap_locked, feed latency ${latency}`,
+      stream: 'twap60s',
+      job: { feeBps: 0, fillDelayMs: 0, spot: true, ...(latency ? { engine: { scheduler: 'global', timers: false, feed_latency: latency } } : {}) },
+      marketEvents: { '0xconf': spotEvents() },
+      js: SPOT_JS,
+      py: SPOT_PY,
+      expectLogs: (logs) => {
+        const at = (now) => logs.split('\n').find((l) => l.includes(`lock ${now} `));
+        if (latency === 0) {
+          // Before the window opens.
+          assert.match(at(39_000), /lock 39000 98\.000000@39000 null$/);
+          // 40..44 s: 100 102 104 106 108 -> 104; 4.5 s elapsed, 5 samples over
+          // 4 whole seconds caps at 1; projected 0.075 * 104 + 0.925 * 108.
+          assert.match(at(44_500), /lock 44500 108\.000000@44000 104\.000000 5 4500 0\.075000 1\.000000 44000 107\.700000$/);
+          // + 130 and 132 at 55 and 56 s: 782 / 7; 7 samples over 16 s is
+          // 0.4375 coverage, so no projection.
+          assert.match(at(56_500), /lock 56500 132\.000000@56000 111\.714286 7 16500 0\.275000 0\.437500 56000 null$/);
+          // At the close: 50 samples (60 s less the 10 missing, the duplicate
+          // not counted) averaging 8350 / 50, coverage 50 / 60; the closing value
+          // is the latest seen but outside the window; the projection is the mean.
+          assert.match(at(100_000), /lock 100000 220\.000000@100000 167\.000000 50 60000 1\.000000 0\.833333 100000 167\.000000$/);
+        } else {
+          // Heard 300 ms late: the 44 s value arrives at 44 300, the tick at 44 800.
+          assert.match(at(44_800), /lock 44800 108\.000000@44000 104\.000000 5 4800 0\.080000 1\.000000 44000 /);
+        }
+      },
+    });
+  }
+}
+
+// twap_locked() answers as of ITS ctx's clock. Session mode: market A's ctx is
+// kept and read from market B's hook at 60 000, while A's own clock is still at
+// its last ordinary event (41 000) though A's spot values keep arriving. And at
+// A's tick at 70 000: 24 samples over 30 s is 0.8 coverage, but the latest
+// value is 7 s old, so no projection.
+{
+  const A = '0xA';
+  const B = '0xB';
+  const aEvents = [book(1000, { asks: [[0.50, 60]], bids: [[0.48, 100]] })];
+  for (let t = 40_000; t <= 63_000; t += 1000) aEvents.push({ kind: 'spot', ts_ms: t, market_id: A, value: 100 + (t - 40_000) / 1000 });
+  aEvents.push({ kind: 'tick', ts_ms: 41_000, market_id: A, value: 1 }, { kind: 'tick', ts_ms: 70_000, market_id: A, value: 1 });
+  const rank = (e) => ({ spot: -1, book: 0, tick: 2 }[e.kind]);
+  aEvents.sort((x, y) => (x.ts_ms - y.ts_ms) || (rank(x) - rank(y)));
+  const bEvents = [{ ...book(1000, { asks: [[0.50, 60]], bids: [[0.48, 100]] }) }, { kind: 'tick', ts_ms: 60_000, market_id: B, value: 1 }];
+  const fmtJs = `const f = (x) => (x == null ? "null" : x.toFixed(6));
+      const show = (l) => (l ? [f(l.value), l.samples, l.elapsed_ms, f(l.coverage), l.last_ts_ms, f(l.projected)].join(" ") : "null");`;
+  for (const latency of [0, 300]) SCENARIOS.push({
+    name: `twap_locked answers as of its own ctx: session, a kept ctx, a stale spot, feed latency ${latency}`,
+    stream: 'twap60s',
+    job: { feeBps: 0, fillDelayMs: 0, mode: 'session', spot: true, ...(latency ? { engine: { scheduler: 'global', timers: false, feed_latency: latency } } : {}) },
+    markets: [{ ...MARKET, market_id: A, close_ts_ms: 100_000 }, { ...MARKET, market_id: B, close_ts_ms: 120_000 }],
+    marketEvents: { [A]: aEvents, [B]: bEvents },
+    js: `export class S {
+    onMarketOpen(ctx, m) { if (m.market_id === "${A}") this.a = ctx; }
+    onTick(ctx, t) {
+      ${fmtJs}
+      if (t.market_id === "${B}") ctx.log("A-from-B " + this.a.now + " " + show(this.a.twap_locked()) + " " + this.a.spot().ts_ms);
+      else ctx.log("A " + ctx.now + " " + show(ctx.twap_locked()));
+      return null;
+    }
+  }`,
+    py: `class S:
+    def on_market_open(self, ctx, market):
+        if market.market_id == "${A}":
+            self.a = ctx
+
+    def on_tick(self, ctx, tick):
+        f = lambda x: "null" if x is None else f"{x:.6f}"
+        show = lambda l: " ".join([f(l.value), str(l.samples), str(l.elapsed_ms), f(l.coverage), str(l.last_ts_ms), f(l.projected)]) if l else "null"
+        if tick.market_id == "${B}":
+            ctx.log("A-from-B " + str(self.a.now) + " " + show(self.a.twap_locked()) + " " + str(self.a.spot().ts_ms))
+        else:
+            ctx.log("A " + str(ctx.now) + " " + show(ctx.twap_locked()))
+        return None
+`,
+    expectLogs: (logs) => {
+      if (latency === 0) {
+        // A at 41 000: 100 and 101 -> 100.5; 1 s elapsed; projection 1/60 * 100.5 + 59/60 * 101.
+        assert.match(logs, /A 41000 100\.500000 2 1000 1\.000000 41000 100\.991667/);
+        // Read from B at 60 000 through A's kept ctx: still A's 41 000 -- not 21
+        // samples against 1 s elapsed, and spot() is the 41 000 value.
+        assert.match(logs, /A-from-B 41000 100\.500000 2 1000 1\.000000 41000 100\.991667 41000/);
+        // A at 70 000: 40..63 s -> 24 samples, mean 111.5, coverage 24/30 = 0.8,
+        // latest value 7 s old -> no projection.
+        assert.match(logs, /A 70000 111\.500000 24 30000 0\.800000 63000 null/);
+      } else {
+        // Heard 300 ms late. A's clock is its last heard ordinary event, 41 300,
+        // however many spot values arrive after it: read from B at 60 300 it is
+        // still 41 300 (1.3 s elapsed, 1 whole second, 2 samples).
+        assert.match(logs, /A 41300 100\.500000 2 1300 1\.000000 41000 100\.989167/);
+        assert.match(logs, /A-from-B 41300 100\.500000 2 1300 1\.000000 41000 100\.989167 41000/);
+      }
+    },
+  });
+}
+
+// A kept ctx under a long feed latency: a value stamped before its clock but
+// heard after it must not change its answers. 1 500 ms: spot 40 000 heard at
+// 41 500, A's tick 41 000 heard at 42 500 (A's clock from then on), spot 42 000
+// heard at 43 500 -- after A's clock. Read from B at 45 500.
+{
+  const A = '0xA';
+  const B = '0xB';
+  const aEvents = [book(1000, { asks: [[0.50, 60]], bids: [[0.48, 100]] }),
+    { kind: 'spot', ts_ms: 40_000, market_id: A, value: 100 },
+    { kind: 'tick', ts_ms: 41_000, market_id: A, value: 1 },
+    { kind: 'spot', ts_ms: 42_000, market_id: A, value: 200 }];
+  const bEvents = [book(1000, { asks: [[0.50, 60]], bids: [[0.48, 100]] }), { kind: 'tick', ts_ms: 44_000, market_id: B, value: 1 }];
+  SCENARIOS.push({
+    name: 'twap_locked of a kept ctx ignores values heard after its clock, feed latency 1500',
+    stream: 'twap60s',
+    job: { feeBps: 0, fillDelayMs: 0, mode: 'session', spot: true, engine: { scheduler: 'global', timers: false, feed_latency: 1500 } },
+    markets: [{ ...MARKET, market_id: A, close_ts_ms: 100_000 }, { ...MARKET, market_id: B, close_ts_ms: 120_000 }],
+    marketEvents: { [A]: aEvents, [B]: bEvents },
+    js: `export class S {
+    onMarketOpen(ctx, m) { if (m.market_id === "${A}") this.a = ctx; }
+    onTick(ctx, t) {
+      const f = (x) => (x == null ? "null" : x.toFixed(6));
+      const ctxs = t.market_id === "${B}" ? this.a : ctx;
+      const l = ctxs.twap_locked();
+      const s = ctxs.spot();
+      ctx.log((t.market_id === "${B}" ? "A-from-B " : "A ") + ctxs.now + " " + f(s.value) + " " + f(l.value) + " " + l.samples + " " + f(l.coverage) + " " + f(l.projected));
+      return null;
+    }
+  }`,
+    py: `class S:
+    def on_market_open(self, ctx, market):
+        if market.market_id == "${A}":
+            self.a = ctx
+
+    def on_tick(self, ctx, tick):
+        f = lambda x: "null" if x is None else f"{x:.6f}"
+        c = self.a if tick.market_id == "${B}" else ctx
+        l = c.twap_locked()
+        s = c.spot()
+        ctx.log(("A-from-B " if tick.market_id == "${B}" else "A ") + str(c.now) + " " + f(s.value) + " " + f(l.value) + " "
+                + str(l.samples) + " " + f(l.coverage) + " " + f(l.projected))
+        return None
+`,
+    expectLogs: (logs) => {
+      // At A's own tick (42 500): only the 40 000 value had arrived; 2.5 s
+      // elapsed, 1 sample over 2 whole seconds = 0.5 coverage -> no projection.
+      assert.match(logs, /A 42500 100\.000000 100\.000000 1 0\.500000 null/);
+      // Read from B at 45 500, after the 42 000 value arrived (43 500): A's
+      // answers are what they were at 42 500.
+      assert.match(logs, /A-from-B 42500 100\.000000 100\.000000 1 0\.500000 null/);
+    },
+  });
+}
+
 // Phase 3b: the recorder on the resting-order script (archive), with timers on
 // (global scheduler), and on generic data — both engines, row for row.
 for (const [label, engine, events, markets, js, py] of [
@@ -1626,6 +1822,45 @@ test('recording changes no trade, fill or fee in either engine', async () => {
   }
 });
 
+test('ctx.spot() and ctx.twap_locked() without the spot dataset are refused, not null forever', async () => {
+  const base = SCENARIOS.find((x) => x.name === 'spot and twap_locked, feed latency 0');
+  for (const lang of ['node', 'python']) {
+    const r = await run(lang, base, { ...base.job, spot: undefined });
+    // The engine's refusal keeps its code in both engines, even from inside a hook.
+    assert.equal(r.result?.rejection?.code, 'E_MANIFEST', `${lang}: ${JSON.stringify(r.result?.rejection)} ${r.stderr}`);
+    assert.match(r.result.rejection.detail, /ctx\.spot\(\) needs the "spot" dataset declared/);
+  }
+});
+
+test('declaring spot changes nothing a strategy does not read, in either engine', async () => {
+  // Resting orders with the recorder, and timers under a feed latency: the
+  // paths where extra (quiet) events could move a job, a sample or a fill.
+  for (const name of ['recorder: resting orders', 'recorder: timers and a feed latency']) {
+    const base = SCENARIOS.find((x) => x.name === name);
+    const events = BUILDERS_FOR_TESTS[base.events]();
+    const close = base.markets[0].close_ts_ms;
+    const spots = [];
+    for (let t = 250; t <= close; t += 250) spots.push({ kind: 'spot', ts_ms: t, market_id: '0xconf', value: 100 + (t % 7), server_ts_ms: t, recv_ts_ms: t });
+    const rank = (e) => (e.kind === 'spot' ? -1 : 0);
+    const withSpot = [...events, ...spots].sort((a, b) => (a.ts_ms - b.ts_ms) || (rank(a) - rank(b)));
+    const plain = { ...base, stream: 'twap60s', marketEvents: { '0xconf': events } };
+    const spotted = { ...base, stream: 'twap60s', marketEvents: { '0xconf': withSpot } };
+    for (const lang of ['node', 'python']) {
+      const off = await run(lang, plain, base.job);
+      const on = await run(lang, spotted, { ...base.job, spot: true });
+      assert.equal(on.code, 0, `${lang}: ${on.stderr}`);
+      assert.ok(off.trades.length > 0, `${name}: nothing traded, so nothing is proved`);
+      assert.deepEqual(on.trades, off.trades, `${lang} ${name}: trades`);
+      assert.deepEqual(on.fills, off.fills, `${lang} ${name}: fills`);
+      assert.deepEqual(on.records, off.records, `${lang} ${name}: record`);
+      assert.equal(on.logs, off.logs, `${lang} ${name}: logs`);
+      assert.equal(on.result.eventsSeen, off.result.eventsSeen, `${lang} ${name}: events seen`);
+      assert.deepEqual(on.result.spot, { markets: 1, markets_without: 0 }, `${lang} ${name}: spot counters`);
+      assert.equal(off.result.spot, null, `${lang}: no counters unless declared`);
+    }
+  }
+});
+
 for (const scenario of SCENARIOS) {
   test(`both engines agree: ${scenario.name}`, async () => {
     // A scenario may carry its own params; without this the new cases would
@@ -1692,6 +1927,7 @@ for (const scenario of SCENARIOS) {
 
     closeEnough(js.result.feesPaid, py.result.feesPaid, 'fees_paid', scenario.name);
     assert.deepEqual(js.result.orders, py.result.orders, `${scenario.name}: order counters`);
+    assert.deepEqual(js.result.spot ?? null, py.result.spot ?? null, `${scenario.name}: spot counters`);
     if (scenario.expectOrders) {
       scenario.expectOrders(js.result.orders);
       scenario.expectOrders(py.result.orders);

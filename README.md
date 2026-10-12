@@ -163,7 +163,10 @@ that much later while orders still match the venue's book
 unexplained size drop left from in front of your order instead of assuming none did — an estimate, so compare it
 with the default ([§12](docs/methodology.md#12-probabilistic-queue-models-optional)). `"record_ms": 60000` adds
 the account's value on a time grid (open legs at the best bid) and its drawdown — `record.csv` in the archive
-([§13](docs/methodology.md#13-the-recorder-mark-to-market-on-a-time-grid)).
+([§13](docs/methodology.md#13-the-recorder-mark-to-market-on-a-time-grid)). Declaring the `spot` dataset gives
+`ctx.spot()` and `ctx.twap_locked()`: how much of the settlement TWAP has already elapsed and at what level — an
+approximation from Chainlink's 1 Hz stream, with its measured error
+([§14](docs/methodology.md#14-spot-and-the-locked-part-of-the-settlement-twap-optional)).
 
 ## Also in the package
 
