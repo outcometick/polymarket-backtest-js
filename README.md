@@ -1,18 +1,20 @@
 <!-- Generated from the outcometick monorepo by scripts/publish-backtest-repo.mjs. Edits here are overwritten; open an issue or a PR and it is ported back. -->
 # outcometick backtest · JavaScript / TypeScript
 
-**Tick-level backtesting for Polymarket and Predict.fun crypto Up/Down markets — and, from your own data, any Polymarket binary market — in JavaScript.** Write a
-strategy class, replay it locally with the `ot` command line against the archived order book, and submit the
-same files to the [hosted backtester](https://outcometick.com/backtest) when you want the full range. Every
-market settles at $1 / $0 on the Chainlink stream it actually settled on, and every taker fill pays the venue's
-taker fee. Market makers get resting limit orders with a queue model built on how Polymarket actually records
+**A tick-level backtester for Polymarket, in JavaScript and TypeScript.** Any binary market — elections,
+sports, crypto, anything with two outcomes — from order-book data you recorded (`ot run --data <your data>`), or
+a free real archive day to start with. Write a strategy class, replay it locally with the `ot` command line, and,
+for the archive's crypto markets, submit the same files to the [hosted backtester](https://outcometick.com/backtest)
+when you want the full range. Fills walk the depth that was there, every market settles at $1 / $0 only on
+evidence of its outcome, and every taker fill pays the venue's taker fee. Market makers get resting limit orders with a queue model built on how Polymarket actually records
 trading, and the markouts to see whether the fills were worth having.
 
 **English** · [简体中文](README.zh-CN.md) · [Docs site](https://outcometick.github.io/polymarket-backtest/) · [For AI agents](https://outcometick.github.io/polymarket-backtest/agents.html) · [Methodology](docs/methodology.md) ·
 [How we verify it](docs/verification.md) · Python: [polymarket-backtest](https://github.com/outcometick/polymarket-backtest)
 
-> Built by [outcometick.com](https://outcometick.com) — the Polymarket and Predict.fun tick-data archive this
-> replays, and the hosted backtester whose engine this is. [More below.](#on-outcometickcom)
+> Open source (MIT), maintained by [outcometick.com](https://outcometick.com), which also publishes a ready-made
+> tick-level archive of Polymarket and Predict.fun crypto Up/Down markets and runs this engine as a hosted
+> backtester. You do not need either. [More below.](#on-outcometickcom)
 
 ```bash
 npm i -g outcometick             # Node 24: the ot CLI, the strategy SDK and the data client
@@ -73,11 +75,12 @@ ot status run_...                      # then: ot fetch run_...
 
 ## What it gets right
 
-**Settlement is the venue's, not an approximation.** A Polymarket crypto market settles on one Chainlink
-stream — the instantaneous feed, a 30-second TWAP or a 60-second TWAP — and which one is stated in that
-market's own config (`twapLookbackSeconds`), not implied by its date. Every market is replayed against its own
-stream and pays $1 or $0 from the official outcome. Predict.fun ties pay 50:50. A market whose stream or outcome
-cannot be read is dropped and listed in the report, never settled on a guess.
+**Settlement is the venue's, not an approximation.** A market pays $1 or $0 only on evidence of its outcome:
+on your own data, Gamma's resolution, a `market_resolved` frame or the resolution you give, and they must agree;
+on the archive's crypto markets, the official outcome on the Chainlink stream that market settled on — the
+instantaneous feed, a 30-second TWAP or a 60-second TWAP, as its own config (`twapLookbackSeconds`) states, not
+as its date implies. Predict.fun ties pay 50:50. A market whose outcome cannot be read is dropped and listed in
+the report, never settled on a guess.
 
 **Two order books per market.** UP and DOWN are separate tokens with separate bids and asks. Buying UP lifts
 UP's asks; getting out sells into UP's bids. (Predict.fun publishes one book per market, so its DOWN side is the

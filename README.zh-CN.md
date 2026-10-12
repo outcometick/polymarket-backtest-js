@@ -1,16 +1,17 @@
 <!-- Generated from the outcometick monorepo by scripts/publish-backtest-repo.mjs. Edits here are overwritten; open an issue or a PR and it is ported back. -->
 # outcometick 回测 · JavaScript / TypeScript
 
-**用 JavaScript 对 Polymarket 与 Predict.fun 加密货币涨跌市场做逐笔回测；自带数据时，任意 Polymarket 二元市场都能回测。** 写一个策略类，用 `ot` 命令行在本地按归档的真实盘口重放；
-想跑完整区间时，把同一份文件提交到[托管回测](https://outcometick.com/zh/backtest)。每个市场都按它实际使用的 Chainlink 结算流
-以 1 美元 / 0 美元结算，每一笔吃单成交都扣平台的吃单手续费。做市策略可以挂限价单：排队模型按 Polymarket 实际的撮合记录方式建立，
+**用 JavaScript / TypeScript 写的 Polymarket 逐笔回测引擎。** 任意二元市场——选举、体育、加密货币，只要是两个结果的市场——
+用你自己录下的盘口数据（`ot run --data <你的数据>`）就能回测；也可以先用一天免费的真实归档上手。写一个策略类，用 `ot` 命令行在本地重放；
+归档里的加密市场想跑完整区间时，把同一份文件提交到[托管回测](https://outcometick.com/zh/backtest)。按当时挂着的深度逐档成交，
+每个市场只在有结果凭据时以 1 美元 / 0 美元结算，每一笔吃单成交都扣平台的吃单手续费。做市策略可以挂限价单：排队模型按 Polymarket 实际的撮合记录方式建立，
 报告给出成交后的价格走势，看这些成交值不值。
 
 [English](README.md) · **简体中文** · [文档站](https://outcometick.github.io/polymarket-backtest/)（英文） · [给 AI agent 的说明](https://outcometick.github.io/polymarket-backtest/agents.html)（英文） · [方法说明](docs/methodology.md)（英文） · [我们怎么验证](docs/verification.md)（英文） ·
 Python 版：[polymarket-backtest](https://github.com/outcometick/polymarket-backtest)
 
-> 出自 [outcometick.com](https://outcometick.com/zh)：这里重放的 Polymarket 与 Predict.fun 逐笔数据归档来自那里，
-> 托管回测用的也是这个引擎。[详见下文。](#outcometickcom-上还有什么)
+> 开源（MIT），由 [outcometick.com](https://outcometick.com/zh) 维护。它另外提供现成的 Polymarket 与 Predict.fun 加密涨跌市场逐笔归档，
+> 并把这个引擎做成了托管回测——这两样都不是必需的。[详见下文。](#outcometickcom-上还有什么)
 
 ```bash
 npm i -g outcometick             # Node 24：ot 命令行、策略 SDK、数据客户端
@@ -70,9 +71,10 @@ ot status run_...                      # 完成后：ot fetch run_...
 
 ## 它做对了什么
 
-**结算按平台规则，不做近似。** Polymarket 的加密市场在一条 Chainlink 流上结算：瞬时流、30 秒 TWAP 或 60 秒 TWAP，用哪条写在
-市场自己的配置里（`twapLookbackSeconds`），不按日期推。每个市场都对着自己的结算流重放，按官方结果兑付 1 美元或 0 美元；
-Predict.fun 平局按 50:50 兑付。读不出结算流或结果的市场会被剔除并在报告里列出，绝不靠猜来结算。
+**结算按平台规则，不做近似。** 市场只在有结果凭据时兑付 1 美元或 0 美元：用你自己的数据时，凭据是 Gamma 的结算状态、
+`market_resolved` 帧或你给出的结果，几处必须一致；用归档里的加密市场时，按该市场实际使用的 Chainlink 结算流上的官方结果——瞬时流、
+30 秒 TWAP 或 60 秒 TWAP，用哪条写在市场自己的配置里（`twapLookbackSeconds`），不按日期推。Predict.fun 平局按 50:50 兑付。
+读不出结果的市场会被剔除并在报告里列出，绝不靠猜来结算。
 
 **每个市场两本盘口。** UP 和 DOWN 是两个代币，各有自己的买卖档位。买 UP 吃 UP 的卖档，平仓卖进 UP 的买档。
 （Predict.fun 每个市场只发布一本盘口，所以它的 DOWN 一侧是 UP 的镜像。）
