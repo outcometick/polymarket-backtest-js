@@ -60,7 +60,7 @@ A hook returns an `Order` (or a list, or nothing):
 | field | meaning |
 | --- | --- |
 | `side` | `"UP"` or `"DOWN"` — which token |
-| `size` | contracts; or `notional` (dollars) with a `limit`, giving `floor(notional / limit)` contracts |
+| `size` | contracts; or `notional` (dollars) with a `limit`, giving `floor(notional / limit)` contracts (0 contracts raises: skip an order whose budget is below the limit price) |
 | `limit` | a ceiling when buying, a floor when selling; levels beyond it are not taken |
 | `reduce_only` | sell into the bids of a token you hold, at most what you hold |
 | `hold_s` | flatten this many seconds after the fill |

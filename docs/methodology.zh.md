@@ -35,7 +35,7 @@ hook 返回一个 `Order`（或列表，或什么都不返回）：
 | 字段 | 含义 |
 | --- | --- |
 | `side` | `"UP"` 或 `"DOWN"`——哪一个代币 |
-| `size` | 合约数；或带 `limit` 的 `notional`（美元），得到 `floor(notional / limit)` 份合约 |
+| `size` | 合约数；或带 `limit` 的 `notional`（美元），得到 `floor(notional / limit)` 份合约（折算为 0 份会直接报错：金额不够一份时请自己跳过这一单） |
 | `limit` | 买入时的上限，卖出时的下限；不吃超出限价的档位 |
 | `reduce_only` | 卖进所持代币的买档，最多卖出持有数量 |
 | `hold_s` | 成交后经过这么多秒平仓 |
