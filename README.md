@@ -60,7 +60,7 @@ export default class Favourite extends Strategy {
 ```
 
 `ot run` prints the headline numbers and writes the whole result — report JSON, every trade and fill as CSV,
-logs, checksums — to a zip you can open in a notebook. A day is decoded on up to 8 threads (`--workers`) and kept
+logs, checksums — to a zip you can open in a notebook. A day is decoded on every core (as many as half the memory allows; `--workers` to choose) and kept
 (`--cache off` to skip that): the sample day takes about 21 s the first time and about 10 s after that, against
 53 s on one thread with no cache — the same result byte for byte either way. When it looks right:
 
