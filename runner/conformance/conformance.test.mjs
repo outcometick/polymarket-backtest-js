@@ -1,18 +1,7 @@
-// The two engines must agree, row for row.
-//
-// Python strategies get a Python engine because an IPC round trip per event
-// cannot fit inside a 400 microsecond budget. That means two implementations of
-// the same matching rules, and two implementations drift — silently, and in a
-// way that makes a report depend on which language the customer happened to
-// write in.
-//
-// This is the thing that stops it. Each scenario below is run through BOTH
-// harnesses as real subprocesses over an identical job directory, and every
-// trade and fill is compared field by field. A change to one engine that is not
-// mirrored in the other fails here.
-//
-// Equivalent strategies are written twice on purpose. Generating one from the
-// other would test the generator, not the engines.
+// Compare JS and Python harnesses as subprocesses on identical jobs.
+// Check each trade and fill field. Equivalent strategies are written
+// independently in both languages.
+// Python uses its own engine to avoid per-event IPC within the 400 us budget.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -50,14 +39,8 @@ const book = (ts, up) => ({
 const tick = (ts, value) => ({ kind: 'tick', ts_ms: ts, market_id: '0xconf', value });
 
 /**
- * The same book, published ONE SIDE PER ROW, the way Polymarket does.
- *
- * Both harnesses have to arrive at the same state from it, and neither may
- * treat the absent side as an instruction to clear that side — which is what an
- * empty ladder means to `Book.snapshot`. The ask ladders are DESCENDING here on
- * purpose: the archive sorts that way on one venue and the other way on the
- * other, so anything that reads element zero disagrees with anything that finds
- * the lowest.
+ * One-sided snapshots with descending asks, as published by Polymarket.
+ * Preserve the absent side and find the lowest ask rather than the first entry.
  */
 const sided = (ts, side, asks, bids) => ({
   kind: 'book', ts_ms: ts, snapshot: true, side,
@@ -113,7 +96,7 @@ function oneSidedEvents() {
   return ev;
 }
 
-/** An unthrottled top-of-book BOUND: prices, no sizes, deletes only. */
+/** A top-of-book bound: prices without sizes, used only for pruning. */
 const bboEv = (ts, side, bid, ask) => ({
   kind: 'book', ts_ms: ts, snapshot: false, bbo: true, side, bid, ask,
 });
@@ -123,21 +106,9 @@ const deltaEv = (ts, side, ladder, px, size) => ({
 });
 
 /**
- * A book that goes stale, and the bounds that clean it up.
- *
- * Built so the two engines cannot agree by both doing nothing: the pruning
- * CHANGES THE FILL PRICE. Levels at 0.40 and 0.42 are left on the ladder from
- * an earlier snapshot, a bound then says nothing better than 0.45 exists, and
- * an order placed afterwards has to fill at 0.45. An engine that skips pruning
- * fills at 0.40 and the two reports diverge on every number downstream.
- *
- * Three behaviours in one fixture, each of which has its own way of going
- * wrong in only one language:
- *   1. stale levels strictly better than the bound are deleted;
- *   2. a level stamped the SAME millisecond as the bound SURVIVES, so the
- *      result does not depend on how a tie was sorted;
- *   3. `bid = 0` with `ask = 1` — how the venue writes "no quotes" — clears
- *      that token outright rather than being discarded as out of range.
+ * Stale depth and pruning bounds that change the fill price from 0.40 to 0.45.
+ * Delete levels strictly better than the bound, preserve same-timestamp levels,
+ * and handle the no-quote sentinels bid=0 and ask=1.
  */
 function bboEvents() {
   return [
@@ -147,9 +118,7 @@ function bboEvents() {
     }),
     tick(1000, 65000),
     tick(1500, 65010),
-    // Nothing better than 0.45 rests on the asks, nothing better than 0.38 on
-    // the bids. 0.40 and 0.42 are stale and go; 0.36 is worse than the bound
-    // and stays, which is what stops this being "delete everything".
+    // Remove stale asks 0.40 and 0.42, but preserve the bid 0.36.
     bboEv(2000, 'UP', 0.38, 0.45),
     tick(2000, 65020),
     // A fresh level and a bound stamped the same instant. The level must
@@ -157,9 +126,7 @@ function bboEvents() {
     deltaEv(2500, 'UP', 'asks', 0.41, 300),
     bboEv(2500, 'UP', 0.38, 0.45),
     tick(2500, 65030),
-    // "No quotes at all" on the other token, written the way the venue writes
-    // it. A [0.001, 0.999] domain check would drop this row and leave a ladder
-    // that the venue has already emptied.
+    // No-quote sentinels must not be discarded by a narrower price-domain check.
     bboEv(3000, 'DOWN', 0, 1),
     tick(3000, 65040),
     tick(3500, 65050),
@@ -167,14 +134,10 @@ function bboEvents() {
 }
 
 /**
- * A mirrored market that resting orders can live in.
- *
- * The book is published the way Polymarket publishes it (UP bids at q are DOWN
- * asks at 1−q), it moves, levels shrink through deltas BEFORE the prints that
- * explain them arrive, the top-of-book stream prunes, and prints come on BOTH
- * tokens — a DOWN buyer consumes resting UP bids. Every path of the queue model
- * is exercised: entry window, ledger, waterfall across prices, cancel window,
- * reduce-only clamp, markouts.
+ * Mirrored resting-order fixture: UP bids at q are DOWN asks at 1-q.
+ * Deltas precede matching prints; bounds prune depth; prints use both tokens.
+ * Exercise entry and cancel windows, the ledger, price waterfall, reduce-only
+ * clamping and markouts.
  */
 function makerEvents() {
   const ev = [];
@@ -215,11 +178,9 @@ function makerEvents() {
 }
 
 /**
- * A generic-data market's stream (runner/generic-data.mjs): one book whose
- * DOWN token is the mirror — snapshots carry both, deltas carry `mirror` and
- * move both legs in one step — prints on both tokens, and a bound stamped the
- * same millisecond as the level it removes (generic data prunes it; input
- * order is real there). Events carry `seq` like decoded generic events.
+ * Generic stream with mirrored snapshots and deltas, prints on both tokens,
+ * and same-ms bounds. Generic input seq defines order, so those bounds prune
+ * earlier levels even when timestamps match.
  */
 function genericEvents() {
   const ev = [];
@@ -329,20 +290,14 @@ class S:
 `;
 
 /**
- * Scenarios. Each is the same behaviour written once per language.
- *
- * They are chosen to hit the places the two engines could plausibly disagree:
- * price quantisation, walking the book, partial fills, reduce_only clamping,
- * settlement, hold expiry, and multiple orders in one event.
+ * Equivalent strategies covering price quantisation, depth walking, partial
+ * fills, reduce-only clamping, settlement, hold expiry and multiple orders.
  */
 Object.assign(BUILDERS_FOR_TESTS, { maker: makerEvents });
 const SCENARIOS = [
   {
-    // Polymarket publishes ONE SIDE PER ROW, and its ask ladder descending.
-    // Both engines have to reach the same book from that: an absent side is
-    // not an instruction to clear that side, and the best ask is the lowest
-    // rather than element zero. Neither is visible in a two-sided fixture, and
-    // a two-sided fixture is all this file had.
+    // One-sided snapshots preserve the absent side; descending asks require
+    // selecting the lowest price.
     name: 'one-sided snapshots, descending ladders',
     events: 'oneSided',
     js: `export class S {
@@ -378,21 +333,11 @@ class S(Strategy):
   },
 
   {
-    // THE UNTHROTTLED TOP OF BOOK, which only deletes.
-    //
-    // A bound is the one input that can make the book WORSE for the strategy,
-    // so an engine that ignores it is strictly more optimistic than one that
-    // does not — and the two would still agree on a fixture where pruning
-    // changes nothing. Here it changes the fill price, so silence is not an
-    // option for either of them.
-    //
-    // The bound is also the only book input with no size, which is exactly the
-    // shape that has been mishandled before: JS quietly no-ops on an undefined
-    // size while Python raises. Both are wrong and they are wrong differently.
+    // Bounds carry no size and only prune. Here pruning changes the fill price,
+    // so ignoring it cannot pass the comparison.
     name: 'an unthrottled top-of-book bound prunes stale levels identically',
     events: 'bbo',
-    // on_book has to be DECLARED or the harness never dispatches it, and the
-    // leak this case exists to catch would go unnoticed in both engines.
+    // Declare on_book so unexpected bound dispatches are observable.
     hooks: ['on_book'],
     js: `export class S {
       onMarketOpen(ctx, m) { this.n = 0; }
@@ -452,13 +397,8 @@ class S(Strategy):
   },
 
   {
-    // A BAD NOTIONAL IS COUNTED, NEVER THROWN — and counted identically.
-    //
-    // `Infinity > 0` is true, so an unchecked positivity test let it through:
-    // JS derived `size = Infinity`, walked the whole book and produced a fill
-    // of NaN, poisoning the position and every number downstream, with nothing
-    // reporting a problem. Python raised OverflowError instead, which fails
-    // the entire run. Same input, two different disasters.
+    // Count invalid notional as a rejection in both engines. Positivity alone
+    // admits Infinity, so require finite values.
     name: 'an infinite notional is refused by both engines, not thrown',
     js: `export class S {
       onMarketOpen(ctx, m) { this.done = false; }
@@ -483,13 +423,8 @@ class S(Strategy):
 `,
   },
   {
-    // Contradictory sizing is refused by BOTH engines, identically.
-    //
-    // The SDK's Order constructor rejects `{size, notional}`, but a hook can
-    // return a plain object that never went through it. Taking `size` there
-    // would trade a contract count while the author believed they had set a
-    // spending cap — silent and expensive, so both engines refuse it, and
-    // refuse it the same way: no fill, no trade.
+    // Plain hook results can bypass SDK construction. Reject combined size
+    // and notional in both engines without producing fills or trades.
     name: 'an order with both a size and a notional is refused by both engines',
     js: `export class S {
       onMarketOpen(ctx, m) { this.done = false; }
@@ -514,16 +449,8 @@ class S(Strategy):
 `,
   },
   {
-    // Sizing by MONEY, not by contracts, which is how nearly every strategy
-    // actually thinks. The conversion lives in the Order constructor of each
-    // SDK, so the two languages have to agree on the arithmetic AND on the
-    // rounding: `floor(notional / limit)`. A one-contract difference here is a
-    // different fill, a different fee and a different P&L.
-    // 80 / 0.64 ON PURPOSE. The first version of this case used 80 / 0.65,
-    // where Python's `//` and JS's Math.floor happen to agree — so it was
-    // green while the two engines disagreed by a whole contract on every
-    // decimal boundary: 80 // 0.64 is 124, Math.floor(80 / 0.64) is 125.
-    // A fixture that lands where two implementations agree tests nothing.
+    // Both SDKs use floor(notional / limit). At 80 / 0.64 this is 125,
+    // whereas Python floor division gives 124; keep this boundary case.
     name: 'an order sized in money fills the same in both engines',
     js: `export class S {
       onMarketOpen(ctx, m) { this.done = false; }
@@ -533,11 +460,7 @@ class S(Strategy):
         return { side: "UP", notional: 80, limit: 0.64 };
       }
     }`,
-    // A PLAIN DICT, matching the JS side's object literal. Returning
-    // Order(...) here made the Python half go through the SDK constructor
-    // while the JS half went through the engine — two different code paths
-    // compared against each other, so the engine's own conversion was never
-    // exercised on the Python side at all.
+    // Return a plain dict to exercise engine conversion, matching JS.
     py: `from outcometick import Strategy
 
 
@@ -577,8 +500,7 @@ class S(Strategy):
 `,
   },
   {
-    // A 50:50 settlement: both legs pay half a dollar. The payout is a
-    // constant in each engine, so this is where a divergence would show.
+    // A tie pays $0.50 on each leg.
     name: 'a hedged position settles 50:50 on a tie',
     markets: [{ ...MARKET, outcome: 'TIE' }],
     js: `export class S {
@@ -638,12 +560,7 @@ class S(Strategy):
 `,
   },
   {
-    // ctx.p is read with ATTRIBUTE access on both sides, exactly as the docs
-    // and every example on /docs/sdk are written. Python received the bare dict
-    // from the job JSON until 2026-08-23, so `ctx.p.entry_z` raised
-    // "'dict' object has no attribute" on the first tick while the identical
-    // JavaScript ran fine — the third silent divergence of this kind, and this
-    // suite missed it only because every case above declares `params: {}`.
+    // ctx.p supports attribute access in both languages.
     name: 'params are read as attributes, the way the docs are written',
     params: { threshold: 0.55, size: 300, hold_s: 90 },
     js: `export class S {
@@ -669,8 +586,7 @@ class S(Strategy):
 `,
   },
   {
-    // Subscript access has to keep working: Rec is a dict subclass, and a
-    // strategy written the other way must not break when we fixed the first.
+    // Rec also supports dict-style parameter access.
     name: 'params are also readable by subscript',
     params: { size: 150 },
     js: `export class S {
@@ -696,10 +612,7 @@ class S(Strategy):
 `,
   },
   {
-    // ctx.ref() — the reference-feed path, which until 2026-08-23 was declared
-    // in the contract, accepted by the validator, billed, and then crashed at
-    // runtime because nothing implemented viewAt/view_at. Both engines now walk
-    // the same interleaved rows and must agree on every fill.
+    // Interleaved reference-feed rows must produce the same fills.
     name: 'both engines see the same reference feed at the same instant',
     references: ['binance:btcusdt:spot:1s'],
     refRows: Array.from({ length: 40 }, (_, i) => ({
@@ -743,9 +656,7 @@ class S(Strategy):
 `,
   },
   {
-    // A reference row stamped after ctx.now must not be reachable — the whole
-    // reason the rows are streamed rather than shipped as a block. Both engines
-    // must report the same "nothing yet" at the same instants.
+    // Reference rows after ctx.now remain invisible in both engines.
     name: 'a reference feed never shows a row from the future',
     references: ['sig'],
     refRows: [
@@ -919,9 +830,8 @@ async function run(lang, scenario, jobOverrides = {}) {
   await mkdir(out, { recursive: true });
 
   const isPy = lang === 'python';
-  // The documented `import { Strategy, Order } from "outcometick"` resolves by
-  // Node walking node_modules upward from the strategy, as it does in the
-  // image. The inline cases never import it; the shipped templates do.
+  // Node resolves template SDK imports through ancestor node_modules,
+  // matching the image layout.
   if (!isPy) await cp(path.join(HERE, '..', 'harness', 'node', 'sdk'), path.join(dir, 'node_modules', 'outcometick'), { recursive: true });
   await writeFile(
     path.join(src, isPy ? 'strategy.py' : 'strategy.mjs'),
@@ -943,10 +853,7 @@ async function run(lang, scenario, jobOverrides = {}) {
   const job = {
     outputKey,
     entry: { file: isPy ? 'strategy.py' : 'strategy.mjs', className: scenario.className ?? 'S' },
-    // Built from a list rather than written out, so a scenario can ask for a
-    // hook the default job does not declare. Without this the bbo case counted
-    // on_book invocations that the harness was never told to dispatch — the
-    // counter stayed at zero in both engines and every mutation passed.
+    // Build hooks from the scenario so declared on_book hooks are dispatched.
     hooks: Object.fromEntries(wantedHooks.map((h) => [h, HOOK_METHOD[h][isPy ? 1 : 0]])),
     arities: Object.fromEntries(wantedHooks.map((h) => [h, 3])),
     params: {},   // per-case params override this via jobOverrides
@@ -957,22 +864,17 @@ async function run(lang, scenario, jobOverrides = {}) {
     limits: { perEventBudgetMicros: 400, logBytesPerRun: LIMITS.logBytesPerRun, logLineChars: LIMITS.logLineChars },
     ...jobOverrides,
   };
-  // Named rather than a chain of booleans: the third builder is where a
-  // `a ? x : b ? y : z` starts silently picking the wrong fixture.
+  // Select the event builder by scenario name.
   const BUILDERS = {
     oneSided: oneSidedEvents, bbo: bboEvents, nearClose: nearCloseEvents, maker: makerEvents, generic: genericEvents,
   };
   const events = (BUILDERS[scenario.events] ?? scenarioEvents)();
 
-  // A scenario may declare reference feeds; their rows are INTERLEAVED into
-  // the same stream in event time, exactly as the worker sends them, so this
-  // exercises the real framing rather than a convenience shortcut.
+  // Interleave reference feeds in event time, matching worker framing.
   const withRefs = (evs) => [...evs, ...(scenario.refRows ?? [])]
     .sort((a, b) => (a.ts_ms - b.ts_ms) || ((a.kind === 'ref' ? 1 : 0) - (b.kind === 'ref' ? 1 : 0)));
-  // Most cases are one market; a case may declare several to exercise the
-  // things that are only wrong ACROSS markets (per-run budgets, state reset).
-  // A market may carry its own events (`scenario.marketEvents[id]`), which is
-  // how the session cases build markets that overlap in time.
+  // Multiple markets exercise shared budgets and state reset.
+  // marketEvents supplies per-market streams for overlapping session cases.
   const marketList = (scenario.markets ?? [MARKET]).map((m) => ({
     market: m,
     stream: scenario.stream ?? 'prices',
@@ -1037,13 +939,8 @@ async function run(lang, scenario, jobOverrides = {}) {
 }
 
 /**
- * Compare a numeric field.
- *
- * An exact equality would be the ideal, and both engines do use IEEE doubles
- * for the same operations in the same order — but summing in a different order
- * anywhere would show up as a last-bit difference, and a last-bit difference is
- * not what this test exists to catch. A tolerance of 1e-9 on values measured in
- * dollars catches every real divergence and no float noise.
+ * Compare numeric fields with a 1e-9 tolerance for floating-point accumulation
+ * differences. Differences within that tolerance are not detected.
  */
 function closeEnough(a, b, field, where) {
   if (a == null && b == null) return;
@@ -1051,17 +948,12 @@ function closeEnough(a, b, field, where) {
   assert.ok(Math.abs(a - b) < 1e-9, `${where}: ${field} is ${a} in node and ${b} in python`);
 }
 
-// ------------------------------------------------------------ the templates
-//
-// templates/<id>/{python,nodejs} are what `ot init` hands a new user and what
-// the public templates repo publishes. They are two hand-written copies of one
-// strategy, which is exactly the shape this file exists for: run the REAL
-// files, not a paraphrase, through both engines on a market that walks into
-// each template's entry condition, and require a trade.
+// Run the actual templates/<id>/{python,nodejs} files supplied by ot init.
+// Each fixture reaches the entry condition and must produce a trade.
 
 const TEMPLATES_DIR = path.join(HERE, '..', '..', 'templates');
 
-/** A market whose book and settlement feed march toward an UP finish. */
+/** A market with rising UP quotes and a settlement feed above the strike. */
 function nearCloseEvents() {
   const ev = [];
   for (let i = 1; i < 100; i += 1) {
@@ -1117,23 +1009,17 @@ SCENARIOS.push(
   await templateScenario('favourite-near-close'),
   await templateScenario('binance-lead', {
     references: ['binance:btcusdt:spot:1s'],
-    // Spot is already up ~15bps by mid-market while the book still sells UP
-    // under 0.65 — the gap the template is written to take. Stamped the way
-    // the worker stamps real 1s bars: at their CLOSE (open + 999ms), and only
-    // from the market open on — so no row sits exactly at the open. A fixture
-    // with a row AT the open hid that the first version looked for one and
-    // never traded in production.
+    // Spot rises about 15 bps while UP remains below 0.65. Stamp 1s bars
+    // at open + 999 ms, matching the worker; no row lands at market open.
     refRows: Array.from({ length: 100 }, (_, i) => ({
       kind: 'ref', name: 'binance:btcusdt:spot:1s', ts_ms: i * 1000 + 999, close: 64000 + i * 1.2,
     })),
   }),
 );
 
-// Resting orders: the queue model is the newest and most intricate code either
-// engine has, so it gets a scenario that walks every path at once — quoting
-// both tokens, cancel/replace by id and by client_id, post_only, a marketable
-// gtc that takes then rests, reduce-only exits — under entry AND cancel
-// latency, with venue and flat fees.
+// Resting-order lifecycle: both tokens, cancel/replace by id and client_id,
+// post_only, marketable gtc and reduce-only exits. Include entry and cancel
+// latency, venue fees and flat fees.
 const MAKER_JS = `export class S {
       onMarketOpen(ctx, m) { this.n = 0; }
       onTick(ctx, t) {
@@ -1209,8 +1095,7 @@ for (const [label, job] of [
     markets: [{ ...MARKET, close_ts_ms: 44_000, fee: { model: 'polymarket-taker-v1', rate: 0.07 } }],
     js: MAKER_JS,
     py: MAKER_PY,
-    // Agreement alone would pass two engines that both never fill a resting
-    // order. Both kinds of liquidity have to show up.
+    // Require both maker and taker fills.
     expectFills: (fills) => {
       assert.ok(fills.some((f) => f.liquidity === 'maker'), 'no maker fill');
       assert.ok(fills.some((f) => f.liquidity === 'maker' && f.action === 'reduce'), 'no maker exit');
@@ -1220,8 +1105,7 @@ for (const [label, job] of [
   });
 }
 
-// Phase 2c: the probabilistic queue models on the same resting-order script,
-// every function, both engines row for row (and a session and generic case).
+// Compare probabilistic queue functions on archive, session and generic cases.
 for (const qp of [{ prob: 'power', n: 3 }, { prob: 'power2', n: 2 }, { prob: 'power3', n: 2 }, { prob: 'log', n: null }, { prob: 'log2', n: null }]) {
   SCENARIOS.push({
     name: `resting orders, queue model ${qp.prob}${qp.n ? ` n=${qp.n}` : ''}`,
@@ -1349,8 +1233,7 @@ SCENARIOS.push({
   },
 });
 
-// Execution options (phase 2a). Each scenario turns one on through job.engine,
-// exactly as the worker, `ot run` and the Python library send it.
+// Pass execution options through job.engine, matching all runner entry points.
 const EXEC_JS = `export class S {
   onMarketOpen(ctx, m) { this.n = 0; }
   onTick(ctx, t) {
@@ -1426,10 +1309,8 @@ SCENARIOS.push({
   expectOrders: (o) => assert.ok(o.rebates > 0),
 });
 
-// Phase 2b: the global scheduler. Timers and a feed latency, in market mode
-// and across overlapping markets in session mode. Every hook logs ctx.now, so
-// the logs ARE the time line: both engines must write the same lines, and the
-// times they print must never go backwards.
+// Check timers and feed latency in market and overlapping session modes.
+// Hook logs must match across engines and their observed clocks must not regress.
 const TIMER_JS = `export class S {
   seen(ctx) { if (this.last != null && ctx.now < this.last) ctx.log("TIMEBACK " + this.last + " " + ctx.now); this.last = ctx.now; }
   onMarketOpen(ctx, m) {
@@ -1620,11 +1501,9 @@ for (const [label, engine, mode] of [
   }
 }
 
-// twap_locked() answers as of ITS ctx's clock. Session mode: market A's ctx is
-// kept and read from market B's hook at 60 000, while A's own clock is still at
-// its last ordinary event (41 000) though A's spot values keep arriving. And at
-// A's tick at 70 000: 24 samples over 30 s is 0.8 coverage, but the latest
-// value is 7 s old, so no projection.
+// twap_locked() uses its own context clock. Reading A from B at 60 000
+// still uses A's last event at 41 000. At A's tick at 70 000, coverage is
+// 24/30 = 0.8 but the latest value is 7 s old, so no projection is available.
 {
   const A = '0xA';
   const B = '0xB';
@@ -1740,8 +1619,7 @@ for (const [label, engine, mode] of [
   });
 }
 
-// Phase 3b: the recorder on the resting-order script (archive), with timers on
-// (global scheduler), and on generic data — both engines, row for row.
+// Compare recorder rows for resting orders, global timers and generic data.
 for (const [label, engine, events, markets, js, py] of [
   ['resting orders', { record_ms: 1000 }, 'maker', [{ ...MARKET, close_ts_ms: 44_000, fee: { model: 'polymarket-taker-v1', rate: 0.07 } }], MAKER_JS, MAKER_PY],
   ['timers and a feed latency', { record_ms: 1500, scheduler: 'global', timers: true, feed_latency: 300 }, 'maker', [{ ...MARKET, open_ts_ms: 1000, close_ts_ms: 30_000 }], TIMER_JS, TIMER_PY],
@@ -1863,8 +1741,7 @@ test('declaring spot changes nothing a strategy does not read, in either engine'
 
 for (const scenario of SCENARIOS) {
   test(`both engines agree: ${scenario.name}`, async () => {
-    // A scenario may carry its own params; without this the new cases would
-    // run against {} and prove nothing.
+    // Forward scenario-specific params.
     const over = {
       ...(scenario.params ? { params: scenario.params } : {}),
       ...(scenario.job ?? {}),
@@ -1878,7 +1755,7 @@ for (const scenario of SCENARIOS) {
 
     assert.equal(js.trades.length, py.trades.length,
       `trade count differs: node ${js.trades.length}, python ${py.trades.length}`);
-    // Recorder samples (record_ms): the same rows, value for value — and none at all when off.
+    // Match recorder samples field by field; emit none when recording is disabled.
     assert.deepEqual(py.records, js.records, `${scenario.name}: record rows differ`);
     if (scenario.expectRecords) scenario.expectRecords(js.records, js.result);
     assert.equal(js.fills.length, py.fills.length,
@@ -1933,7 +1810,7 @@ for (const scenario of SCENARIOS) {
       scenario.expectOrders(py.result.orders);
     }
     assert.equal(js.result.marketsRun, py.result.marketsRun);
-    // Agreement alone would pass two engines that are wrong the same way.
+    // Check against hand-computed expectations as well as engine parity.
     if (scenario.expect) {
       scenario.expect(js.trades);
       scenario.expect(py.trades);
@@ -1981,18 +1858,11 @@ test('session mode: resting orders in overlapping markets — rows leave only on
   assert.deepEqual(py.result.maker, js.result.maker);
 });
 
-// Both bounds on the result channel, checked in both engines at once.
-//
-// These exist because the result line is an OUTPUT CHANNEL the strategy can
-// drive: ctx.log was once per-market and unbounded per line, and
-// ctx.assert_outcome still had no cap at all. Whatever the limit is, it has to
-// be the same limit in both engines — a cap that holds only in JavaScript is a
-// cap a Python strategy walks straight past.
+// Enforce identical log and crosscheck output limits in both engines.
 test('both engines bound the result channel the same way', async () => {
   const scenario = {
     name: 'a strategy that logs and cross-checks as hard as it can',
-    // Multi-byte on purpose: the run budget is bytes, and counting characters
-    // would let this write three times what it is charged for.
+    // Multi-byte text distinguishes UTF-8 byte accounting from character counts.
     js: `export class S {
       onMarketOpen(ctx, m) {}
       onTick(ctx, t) {
@@ -2040,12 +1910,8 @@ class S(Strategy):
 });
 
 test('both engines agree once a fill delay is applied', async () => {
-  // The delay path reschedules orders against a later book, and the two
-  // implementations queue them separately. A different insertion order shows up
-  // here and nowhere else.
-  // By NAME, not by index: inserting a scenario above silently repointed
-  // this at a different one, and the test then failed for a reason that
-  // had nothing to do with fill delays.
+  // Compare delayed-order queue ordering. Select the scenario by name
+  // so inserting cases does not change the fixture.
   const scenario = SCENARIOS.find((x) => x.name === 'in and out repeatedly, driven by the rolling z-score');
   assert.ok(scenario, 'the z-score scenario was renamed or removed');
   const [js, py] = await Promise.all([
@@ -2306,10 +2172,8 @@ test('cross-market reads are refused in both engines', async () => {
       + '    def on_tick(self, ctx, tick):\n        ctx.book("0xother")\n',
   };
   const [js, py] = await Promise.all([run('node', cross), run('python', cross)]);
-  // The JS engine surfaces it through the hook wrapper as E_RUNTIME; Python
-  // lets the RunAbort through as E_STATE. Both refuse, and both say why —
-  // but the CODE differing is a real inconsistency worth pinning here so it
-  // is a deliberate decision rather than an accident.
+  // Known mismatch: JS wraps the hook refusal as E_RUNTIME; Python preserves
+  // RunAbort as E_STATE. Both reject the order with a reason.
   assert.ok(['E_STATE', 'E_RUNTIME'].includes(js.result.rejection.code));
   assert.ok(['E_STATE', 'E_RUNTIME'].includes(py.result.rejection.code));
   assert.match(js.result.rejection.detail, /session/);
@@ -2345,10 +2209,7 @@ test('both engines refuse an unsupported time-in-force, and gtc without a restin
 });
 
 test('neither engine lets a strategy steal the market before its first hook', async () => {
-  // The cross-language version of the harness test: the interception point
-  // differs (JSON.parse in JS, json.loads in Python) but
-  // the hole was the same — the harness materialised the whole market before
-  // replay, and the strategy was imported first.
+  // Intercept JSON.parse/json.loads to check that future events remain unread.
   const thief = {
     name: 'thief',
     js: `
@@ -2403,18 +2264,10 @@ class S:
 });
 
 test('an allowed dependency cannot write forged rows into the report', async () => {
-  // The verified hole this channel exists to close: `/out` was a writable bind
-  // mount, and a Python strategy declaring the allowlisted `pandas` could call
-  // DataFrame.to_json('/out/trades.jsonl') from on_settle — AFTER being told
-  // the official outcome — and write profitable trades with valid market ids
-  // and in-window timestamps. It needed no analyser bypass, and reconcileRows
-  // cannot tell a forged row from an engine one: it checks that the market
-  // existed, not that the fill happened.
-  //
-  // Now there is no writable mount, and every line is MACed with a key that
-  // arrives on stdin and never touches a filesystem. /proc/self/fd/3 IS
-  // addressable — a pipe alone is not enough — so the MAC is what makes a
-  // direct write produce lines the worker drops.
+  // No writable output mount is exposed. Authenticate result lines with a MAC
+  // key passed on stdin, never written to disk. /proc/self/fd/3 allows direct
+  // writes, so a pipe alone is insufficient.
+  // Market-id and timestamp reconciliation cannot prove that a fill occurred.
   const forger = {
     name: 'forger',
     js: `export class S {
@@ -2454,17 +2307,14 @@ test('an allowed dependency cannot write forged rows into the report', async () 
   const py = await run('python', forger, {
     hooks: { on_market_open: 'on_market_open', on_tick: 'on_tick', on_settle: 'on_settle' },
   });
-  // The strategy never returned an order, so ANY trade row would be forged.
+  // No order was returned, so any trade row is forged.
   assert.deepEqual(py.trades, [], 'a forged trade reached the report');
   assert.equal(py.result.marketsRun, 1, 'the real run still completed');
 });
 
 test('both engines agree on the budget defaults', async () => {
-  // Not decoration: this decides whether a run is rejected, so the two engines
-  // disagreeing means the same strategy passes in one language and fails in the
-  // other. The floor in particular was raised for a measured reason — see
-  // BudgetMonitor in engine/replay.mjs — and raising it in one place only would
-  // have left Python strategies dying of their own warm-up.
+  // Keep budget thresholds and the minimum sample count aligned with
+  // BudgetMonitor in engine/replay.mjs.
   const { readFile } = await import('node:fs/promises');
   const js = await readFile(path.join(HERE, '..', 'engine', 'replay.mjs'), 'utf8');
   const py = await readFile(path.join(HERE, '..', 'harness', 'python', 'otengine.py'), 'utf8');
@@ -2475,44 +2325,26 @@ test('both engines agree on the budget defaults', async () => {
   assert.deepEqual(jsDefaults.slice(1), pyDefaults.slice(1),
     'the two engines disagree about the per-event budget');
 
-  // The VERDICT, not just the numbers. Both engines have to judge the mean:
-  // one judging a breach rate and the other a mean is the same strategy passing
-  // in one language and failing in the other, and that difference is invisible
-  // until a customer hits it. Read from the source because the Python half runs
-  // in another process.
+  // Both monitors judge mean time, not breach rate. Inspect Python source
+  // because its monitor runs in another process.
   assert.match(js, /windowMicros > this\.limitMicros/,
     'the JS engine no longer judges sustained cost over a window');
   assert.match(py, /self\.window_micros > self\.limit_micros/,
     'the Python engine no longer judges sustained cost over a window');
-  // A LIFETIME mean is the specific wrong answer here: one monitor covers the
-  // whole run, so it lets a cheap prefix pay for an expensive phase.
+  // A lifetime mean would let a cheap prefix mask an expensive phase.
   assert.ok(!/breached[\s\S]{0,120}this\.avgMicros > this\.limitMicros/.test(js),
     'the JS verdict is back on the lifetime mean');
   assert.ok(!/def breached[\s\S]{0,200}total_micros \/ self\.count/.test(py),
     'the Python verdict is back on the lifetime mean');
-  // And neither still takes a tolerance: a knob that no longer decides anything
-  // is one a future reader will wire back up, believing it does.
+  // Neither monitor should accept the obsolete tolerance option.
   assert.ok(!/constructor\(\{[^}]*tolerance/.test(js),
     'the JS constructor still takes a tolerance — the breach rate is a diagnostic, not a verdict');
   assert.ok(!/def __init__\([^)]*tolerance/.test(py),
     'the Python constructor still takes a tolerance — the breach rate is a diagnostic, not a verdict');
 });
 
-// THE WHOLE TABLE OF UNUSABLE ORDERS, both engines, one assertion each.
-//
-// This exists because the same bug was fixed three times in a row and a new
-// shape walked past each fix: an infinite notional, then a size and a notional
-// together, then a bad `limit` on a plain size order. Patching a consumption
-// point one condition at a time produces an engine that rejects what it
-// happens to have been asked about.
-//
-// The divergence was worse than the hole: JS filled 10 contracts at an
-// infinite limit while Python raised OverflowError — one silently traded, the
-// other failed the entire run, on the same input.
-//
-// Driven through the engines directly rather than through a strategy: this is
-// about the consumption point, and a hook returning these would be testing the
-// SDK constructor instead.
+// Test invalid orders directly at each engine's consumption point, bypassing
+// SDK constructors. Include non-finite values and contradictory sizing.
 test('both engines reject the same unusable orders, and neither throws', async () => {
   const { Portfolio } = await import('../engine/portfolio.mjs');
   const { Book } = await import('../engine/book.mjs');
@@ -2531,10 +2363,7 @@ test('both engines reject the same unusable orders, and neither throws', async (
     ['a NaN limit', { side: 'UP', size: 10, limit: NaN }],
     ['a limit above one', { side: 'UP', size: 10, limit: 2 }],
     ['a limit below zero', { side: 'UP', size: 10, limit: -1 }],
-    // COERCION IS NOT VALIDATION, and the two languages coerce differently.
-    // `Number('10')` and `float('10')` both give 10, but `Number([10])` gives
-    // 10 where `float([10])` raises — so `{ size: [10] }` filled ten contracts
-    // in JS and was rejected in Python, from one strategy, on one input.
+    // Reject coerced values: Number([10]) is 10, but float([10]) raises.
     ['a numeric string for a size', { side: 'UP', size: '10' }],
     ['a numeric string for a limit', { side: 'UP', size: 10, limit: '0.5' }],
     ['an array for a size', { side: 'UP', size: [10] }],
@@ -2607,11 +2436,8 @@ print(json.dumps(out))
 // session mode across markets that overlap in time
 // ---------------------------------------------------------------------------
 
-// Session mode shares one instance across markets. It used to be fed market
-// after market, so a market open 00:00–00:15 was replayed to its end before one
-// that opened at 00:05 — and the instance carried 00:15 into 00:05. The stream
-// is now one time order (runner/session-feed.mjs); this pins that, and that
-// both engines replay it identically, fills included.
+// Session mode shares one instance across markets. Merge events in time order
+// with runner/session-feed.mjs and compare fills across both engines.
 test('session mode replays overlapping markets in one time order, identically in both engines', async () => {
   const A = { market_id: '0xA', asset: 'BTC', interval: '15m', strike: 65000, outcome: 'UP', open_ts_ms: 0, close_ts_ms: 15_000 };
   const B = { market_id: '0xB', asset: 'BTC', interval: '5m', strike: 65000, outcome: 'DOWN', open_ts_ms: 5_000, close_ts_ms: 20_000 };
@@ -2674,9 +2500,8 @@ test('session mode replays overlapping markets in one time order, identically in
 // venue fees
 // ---------------------------------------------------------------------------
 
-// Polymarket charges the taker C × rate × p × (1 − p), rounded to 5 decimals.
-// Expected values are worked by hand here, never taken from either engine:
-// agreement alone would pass two engines that are wrong the same way.
+// Hand-computed venue fees: C × rate × p × (1 - p), rounded to five decimals
+// per level. Independent expectations complement engine parity.
 const FEE_BUY = {
   name: 'fee-buy',
   js: `export class S {
@@ -2726,12 +2551,8 @@ for (const [label, fee, fees, want] of [
   });
 }
 
-// Time moves for every hook, not only for events. B schedules a delayed order
-// at 1s that lands at 6s; nothing else happens until A settles at 200s. A's
-// on_settle runs at 200s, so B's fill (at 6s) has happened: a strategy that
-// kept B's ctx and reads it there must see the position. Before, only an
-// EVENT advanced the other markets, and an opening or a settlement saw the
-// shared portfolio as it was before the delayed fill.
+// Advance all markets before every hook. B's delayed fill at 6s must be
+// visible through its retained context when A settles at 200s.
 test('session mode advances every open market before openings and settlements too', async () => {
   const A = { market_id: '0xA', asset: 'BTC', interval: '15m', strike: 65000, outcome: 'UP', open_ts_ms: 0, close_ts_ms: 200_000 };
   const B = { market_id: '0xB', asset: 'BTC', interval: '15m', strike: 65000, outcome: 'DOWN', open_ts_ms: 1_000, close_ts_ms: 300_000 };

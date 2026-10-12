@@ -1,4 +1,4 @@
-// Buy the favourite in the last minute, unless it is already priced as a certainty.
+// Buy the favourite in the last minute when its ask is within the entry range.
 //
 //   ot check examples/favourite
 //   ot run examples/favourite --data ./polymarket-data-samples
