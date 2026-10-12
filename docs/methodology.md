@@ -47,11 +47,17 @@ Two books per market: UP and DOWN, each with bids and asks.
   never changes density part-way through a report.
 - **Best bid/ask as a bound.** The unthrottled `best_bid_ask` stream carries prices without sizes. It is applied as
   a deletion only: levels strictly better than the latest best price, and older than it, are removed. It never
-  adds a level, because a level without a size would be invented liquidity. It does not reach a hook. Opt in by
-  declaring the `bbo` dataset.
+  adds a level, because a level without a size would be invented liquidity. It does not reach a hook. It is on
+  whenever `book` is declared: the `bbo` dataset comes with it.
 
 What this cannot restore: between snapshots, a level added or resized in a delta that the cadence dropped is
 missing or stale until the next snapshot. That applies at the top of the book as well as below it.
+
+How much that is, measured against the venue's full stream over 24 hours of live Polymarket crypto markets
+(2026-10-11 to 2026-10-12, replayed in backtest order): the best price rebuilt from the archive's book differed
+from the venue's at 50.6% of sampled moments, and at 36.5% with `best_bid_ask` applied. Most of what remains is a
+better level added in a dropped delta, which a price-only stream cannot add back. The report's `book_age` block
+(section 7) shows how much of a run's taker size came from levels last set more than a second before the fill.
 
 ## 3. Orders and fills
 
@@ -189,6 +195,7 @@ baselines are price measures and are computed before fees.
 | `slippage` | fills at the quote, fills that walked the book, unfilled orders, slippage percentiles, PnL lost to slippage |
 | `fee_model` | the fee policy, model, rounding assumption, and markets charged / known zero / unknown |
 | `coverage` | market-days scanned, every dropped market-day with its reason, which settlement stream each market used, which days the best-bid/ask refinement applied to |
+| `book_age` | taker size by the age of the book level it took: fill time minus when that level was last set by a snapshot or delta (archive markets only) |
 | `equity` | realised PnL, one point per closed trade (thinned to 2,000 points, keeping every extreme) |
 
 Full trade and fill rows are in `Result.trades` / `Result.fills` (and in the hosted run's archive). `Result.markets`

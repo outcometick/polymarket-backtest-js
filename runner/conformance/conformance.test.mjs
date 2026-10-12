@@ -1805,6 +1805,8 @@ for (const scenario of SCENARIOS) {
     closeEnough(js.result.feesPaid, py.result.feesPaid, 'fees_paid', scenario.name);
     assert.deepEqual(js.result.orders, py.result.orders, `${scenario.name}: order counters`);
     assert.deepEqual(js.result.spot ?? null, py.result.spot ?? null, `${scenario.name}: spot counters`);
+    // Integer counters: equal, not close.
+    assert.deepEqual(js.result.bookAge ?? null, py.result.bookAge ?? null, `${scenario.name}: book_age counters`);
     if (scenario.expectOrders) {
       scenario.expectOrders(js.result.orders);
       scenario.expectOrders(py.result.orders);
