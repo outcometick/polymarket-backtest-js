@@ -64,7 +64,7 @@ A hook returns an `Order` (or a list, or nothing):
 | `limit` | a ceiling when buying, a floor when selling; levels beyond it are not taken |
 | `reduce_only` | sell into the bids of a token you hold, at most what you hold |
 | `hold_s` | flatten this many seconds after the fill |
-| `tif` | `"ioc"` only |
+| `tif` | `"ioc"` (the default), or `"gtc"` for a resting order (Polymarket; below) |
 
 **Matching** walks the book from the best level outward and consumes what it takes, so two orders in one event
 cannot fill against the same depth. What the book does not have is reported as unfilled. The fill row records the
@@ -158,7 +158,8 @@ Details that the report's `fee_model` block states:
   whose schedule we cannot read, or whose curve is not the documented one (`exponent ≠ 1`), is charged nothing and
   counted as unknown. The Predict.fun archive carries no fee schedule, so a Predict.fun run is fee-free unless you
   set `fee_bps`.
-- *Maker rebates* are not modelled: a backtest never makes.
+- *Maker rebates* are not part of the venue policy: the venue pays them from a pool, not per fill. Setting
+  `maker_rebate` (section 10) credits an estimate.
 
 Fees are in every trade's PnL and in net PnL. Edge per contract, the Brier score, calibration and the naive
 baselines are price measures and are computed before fees.
@@ -277,8 +278,8 @@ compares them trade by trade.
   position and floored to the grid before it is checked, so a dust position below the minimum is held to
   settlement, as it would be on the venue. `"venue"` reads each market's own tick and minimum (your own data);
   `"assumed"` is for the archive, whose markets do not carry them: tick 0.001 and minimum 5 shares, the values
-  measured on the archive. The report says it is an assumption — a market quoting in 0.01 would accept a 0.001
-  limit here, one quoting finer would refuse it. Refusals are counted by reason (`below_min_size`, `size_step`,
+  measured on the archive. The report says it is an assumption — a market quoting in 0.01 would refuse a 0.001
+  limit accepted here, one quoting finer would accept limits refused here. Refusals are counted by reason (`below_min_size`, `size_step`,
   `off_tick`).
 - **`maker_rebate`** (a fraction, e.g. 0.2) credits each resting fill with that share of the taker fee the same
   fill would have cost, as a negative fee. An estimate: the venue pays maker rebates from a daily pool, pro rata,
