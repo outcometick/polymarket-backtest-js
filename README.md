@@ -60,8 +60,9 @@ export default class Favourite extends Strategy {
 ```
 
 `ot run` prints the headline numbers and writes the whole result — report JSON, every trade and fill as CSV,
-logs, checksums — to a zip you can open in a notebook. Decoded days are cached (`--cache off` to skip it), so
-running the sample day again takes about 11 s instead of 53 s, with the same result byte for byte. When it looks right:
+logs, checksums — to a zip you can open in a notebook. A day is decoded on up to 8 threads (`--workers`) and kept
+(`--cache off` to skip that): the sample day takes about 21 s the first time and about 10 s after that, against
+53 s on one thread with no cache — the same result byte for byte either way. When it looks right:
 
 ```bash
 export OT_BACKTEST_KEY=bt_...          # from outcometick.com/backtest

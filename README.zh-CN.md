@@ -58,7 +58,8 @@ export default class Favourite extends Strategy {
 ```
 
 `ot run` 会打印主要指标，并把完整结果（报告 JSON、全部成交和 fill 的 CSV、日志、校验和）写成一个 zip，可以直接拿到 notebook 里用。
-解码后的数据会缓存（`--cache off` 关闭），同一个样本日再跑约 11 秒（首次约 53 秒），结果逐字节相同。确认没问题后：
+一天的数据最多用 8 个线程解码（`--workers`），解码结果会缓存（`--cache off` 关闭）：样本日首次约 21 秒、再跑约 10 秒，
+单线程且不缓存约 53 秒，结果逐字节相同。确认没问题后：
 
 ```bash
 export OT_BACKTEST_KEY=bt_...          # 在 outcometick.com/zh/backtest 获取
