@@ -9,7 +9,7 @@ when you want the full range. Fills walk the depth that was there, every market 
 evidence of its outcome, and every taker fill pays the venue's taker fee. Market makers get resting limit orders with a queue model built on how Polymarket actually records
 trading, and the markouts to see whether the fills were worth having.
 
-**English** · [简体中文](README.zh-CN.md) · [Docs site](https://outcometick.github.io/polymarket-backtest/) · [For AI agents](https://outcometick.github.io/polymarket-backtest/agents.html) · [Methodology](docs/methodology.md) ·
+**English** · [简体中文](README.zh-CN.md) · [Docs site](https://outcometick.github.io/polymarket-backtest/) · [For AI agents](https://outcometick.github.io/polymarket-backtest/agents/) · [Methodology](docs/methodology.md) ·
 [How we verify it](docs/verification.md) · Python: [polymarket-backtest](https://github.com/outcometick/polymarket-backtest)
 
 > Open source (MIT), maintained by [outcometick.com](https://outcometick.com), which also publishes a ready-made

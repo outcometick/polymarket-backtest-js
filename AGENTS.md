@@ -7,7 +7,7 @@ Notes for AI coding agents working with this repository.
 
 `outcometick` on npm: the JavaScript/TypeScript SDK, the `ot` CLI and a tick-level backtester for Polymarket and
 Predict.fun crypto Up/Down markets, and for any Polymarket binary market from your own data. Read
-[For AI agents](https://outcometick.github.io/polymarket-backtest/agents.html) first, or the whole documentation as one
+[For AI agents](https://outcometick.github.io/polymarket-backtest/agents/) first, or the whole documentation as one
 file: [llms-full.txt](https://outcometick.github.io/polymarket-backtest/llms-full.txt).
 
 This repository is GENERATED from the outcometick monorepo on every release; pull requests are read and ported back
